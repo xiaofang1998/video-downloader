@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>视频代下载 · 接单控制台</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1e222d; --line:#2a2f3d;
+    --fg:#e6e9f0; --dim:#8b93a7; --accent:#4c8dff; --ok:#2fbf71;
+    --warn:#e8a33d; --err:#e8564a; --info:#5aa9e6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{position:sticky;top:0;z-index:10;background:rgba(15,17,23,.92);
+         backdrop-filter:blur(8px);border-bottom:1px solid var(--line);
+         padding:14px 20px;display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+  h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.3px}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
+  .chip{background:var(--panel2);border:1px solid var(--line);border-radius:999px;
+        padding:3px 11px;font-size:12px;color:var(--dim);white-space:nowrap}
+  .chip b{color:var(--fg);font-weight:600}
+  main{display:grid;grid-template-columns:minmax(320px,380px) 1fr;
+       gap:18px;padding:18px;align-items:start}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:16px}
+  .card h2{font-size:13px;margin:0 0 12px;color:var(--dim);font-weight:600;
+           text-transform:uppercase;letter-spacing:.8px}
+  textarea,input{width:100%;background:var(--panel2);border:1px solid var(--line);
+                 border-radius:8px;color:var(--fg);padding:10px;font:inherit;
+                 font-family:inherit;resize:vertical}
+  textarea{min-height:130px;line-height:1.55}
+  textarea:focus,input:focus{outline:none;border-color:var(--accent)}
+  .row{display:flex;gap:8px;margin-top:8px}
+  .row input{flex:1}
+  button{background:var(--accent);color:#fff;border:0;border-radius:8px;
+         padding:9px 15px;font:inherit;font-weight:500;cursor:pointer;
+         transition:filter .15s}
+  button:hover{filter:brightness(1.12)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
+  button.tiny{padding:5px 10px;font-size:12px}
+  .hint{color:var(--dim);font-size:12px;margin-top:10px;line-height:1.7}
+  .hint code{background:var(--panel2);padding:1px 5px;border-radius:4px;
+             font-size:11px;color:var(--info)}
+  .orders{display:flex;flex-direction:column;gap:12px}
+  .order{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+         padding:14px;transition:border-color .2s}
+  .order.done{border-color:#1f6b45}
+  .order.failed,.order.need_manual{border-color:#6b3320}
+  .order.active{border-color:#2b4a7d}
+  .order-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .st{font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;
+      background:var(--panel2);border:1px solid var(--line);white-space:nowrap}
+  .st.done{background:#12351f;border-color:#1f6b45;color:var(--ok)}
+  .st.failed{background:#3a1a15;border-color:#6b3320;color:var(--err)}
+  .st.need_manual{background:#3a2c12;border-color:#6b5a20;color:var(--warn)}
+  .st.downloading,.st.resolving,.st.resolved,.st.packaging{
+      background:#122436;border-color:#2b4a7d;color:var(--info)}
+  .oid{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+  .who{color:var(--dim);font-size:12px;margin-left:auto}
+  .msg{background:var(--panel2);border-radius:8px;padding:9px 11px;margin:10px 0;
+       font-size:13px;color:#c3cadd;white-space:pre-wrap;word-break:break-all;
+       max-height:96px;overflow:auto}
+  .bar{height:4px;background:var(--panel2);border-radius:2px;overflow:hidden;
+       margin:9px 0}
+  .bar i{display:block;height:100%;background:var(--accent);transition:width .35s}
+  .bar.done i{background:var(--ok)}
+  .bar.failed i{background:var(--err)}
+  .meta{font-size:12px;color:var(--dim);word-break:break-all}
+  .meta a{color:var(--info);text-decoration:none}
+  .reply{margin-top:10px;border-top:1px dashed var(--line);padding-top:10px}
+  .reply-txt{background:#101a15;border:1px solid #1f4030;border-radius:8px;
+             padding:10px;font-size:13px;white-space:pre-wrap;word-break:break-word}
+  .acts{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}
+  details{margin-top:10px}
+  summary{cursor:pointer;color:var(--dim);font-size:12px;user-select:none}
+  pre{background:var(--panel2);border-radius:8px;padding:10px;font-size:11.5px;
+      overflow:auto;max-height:230px;color:#98a2b8;white-space:pre-wrap;
+      word-break:break-all;line-height:1.55}
+  .empty{color:var(--dim);text-align:center;padding:44px 0;font-size:13px}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);
+         background:var(--ok);color:#fff;padding:10px 20px;border-radius:8px;
+         font-size:13px;opacity:0;pointer-events:none;transition:opacity .25s;
+         z-index:99;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+  .toast.show{opacity:1}
+  .toast.err{background:var(--err)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🎬 视频代下载 · 接单控制台</h1>
+  <div class="chips" id="chips"></div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>接单</h2>
+    <textarea id="text" placeholder="把买家发来的消息整段粘进来，例如：&#10;&#10;7.92 复制打开抖音，看看【@小明 的作品】这个视频太搞笑了 https://v.douyin.com/iRNBho6/"></textarea>
+    <div class="row">
+      <input id="conversation" placeholder="买家/会话标识（可选）">
+      <input id="sender" placeholder="买家昵称（可选）" style="max-width:150px">
+    </div>
+    <div class="row">
+      <button id="submit" onclick="submitOrder()">开始处理</button>
+      <button class="ghost" onclick="document.getElementById('text').value=''">清空</button>
+    </div>
+    <div class="hint">
+      提示：链接、分享文案、甚至只有一句标题都可以。
+      <br>没链接时系统会拿标题去 <b>Google / DuckDuckGo</b> 搜索落源。
+      <br>受版权保护的平台（腾讯视频/爱奇艺等）会被自动识别并转为人工。
+      <br><code>Ctrl+Enter</code> 快速提交
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>订单</h2>
+    <div class="orders" id="orders"><div class="empty">暂无订单</div></div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+let busy = false;
+
+function apiUrl(path){
+  if(!TOKEN) return path;
+  return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+}
+function toast(msg, isErr){
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (isErr ? ' err' : '');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.className = 'toast', 2000);
+}
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtSize(n){
+  if(!n) return '—';
+  const u = ['B','KB','MB','GB']; let i = 0, v = n;
+  while(v >= 1024 && i < u.length-1){ v /= 1024; i++; }
+  return v.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+
+async function submitOrder(){
+  const text = document.getElementById('text').value.trim();
+  if(!text){ toast('先粘贴买家消息', true); return; }
+  const btn = document.getElementById('submit');
+  btn.disabled = true; btn.textContent = '提交中…';
+  try{
+    const r = await fetch(apiUrl('/api/orders'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        text,
+        conversation_id: document.getElementById('conversation').value.trim(),
+        sender: document.getElementById('sender').value.trim(),
+      })
+    });
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || '提交失败');
+    toast(d.created ? '已接单 #' + d.order.id : '重复消息，已忽略');
+    if(d.created){ document.getElementById('text').value = ''; }
+    await refresh();
+  }catch(e){ toast(e.message, true); }
+  finally{ btn.disabled = false; btn.textContent = '开始处理'; }
+}
+
+async function act(id, what, label){
+  try{
+    const r = await fetch(apiUrl('/api/orders/' + id + '/' + what), {method:'POST'});
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || '操作失败');
+    toast(label || '已执行');
+    await refresh();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function copyReply(id){
+  try{
+    const r = await fetch(apiUrl('/api/orders/' + id));
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || '读取失败');
+    await navigator.clipboard.writeText(d.reply || '');
+    await fetch(apiUrl('/api/orders/' + id + '/replied'), {method:'POST'});
+    toast('回话已复制，去闲鱼粘贴吧');
+    await refresh();
+  }catch(e){
+    toast('复制失败，请手动选中：' + e.message, true);
+  }
+}
+
+function downloadFile(id){
+  window.location.href = apiUrl('/api/orders/' + id + '/file');
+}
+
+async function revealFile(id){
+  try{
+    const r = await fetch(apiUrl('/api/orders/' + id + '/reveal'), {method:'POST'});
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || '打开失败');
+    toast(d.opened ? '已在资源管理器里定位' : '系统不支持自动打开，路径见提示');
+  }catch(e){ toast(e.message, true); }
+}
+
+async function revealDir(){
+  try{
+    const r = await fetch(apiUrl('/api/reveal-dir'), {method:'POST'});
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || '打开失败');
+    toast(d.opened ? '已打开下载目录' : '路径：' + d.path);
+  }catch(e){ toast(e.message, true); }
+}
+
+async function refresh(){
+  if(busy) return;
+  busy = true;
+  try{
+    const r = await fetch(apiUrl('/api/state'));
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || '');
+    renderChips(d);
+    renderOrders(d.orders || []);
+  }catch(e){
+    document.getElementById('chips').innerHTML =
+      '<span class="chip" style="color:var(--err)">连接失败：' + esc(e.message) + '</span>';
+  }finally{ busy = false; }
+}
+
+function renderChips(d){
+  const s = d.stats || {};
+  const chips = [
+    ['订单总数', s.total || 0],
+    ['进行中', s.active || 0],
+    ['已完成', s.done || 0],
+    ['需人工', s.need_manual || 0],
+    ['失败', s.failed || 0],
+    ['排队', d.pending || 0],
+  ];
+  document.getElementById('chips').innerHTML = chips.map(
+    ([k,v]) => `<span class="chip">${k} <b>${v}</b></span>`
+  ).join('') + `<span class="chip" style="cursor:pointer" onclick="revealDir()" title="${esc(d.download_dir||'')}">📂 下载目录 <b>点我打开</b></span>`
+    + `<span class="chip" title="${esc((d.engines||[]).join(' / '))}">引擎 <b>${esc((d.engines||[])[0]||'-')}</b></span>`
+    + `<span class="chip" title="${esc(d.search||'')}">搜索 <b>${esc((d.search||'').split('→')[0].trim()||'-')}</b></span>`;
+}
+
+function renderOrders(orders){
+  const box = document.getElementById('orders');
+  if(!orders.length){ box.innerHTML = '<div class="empty">暂无订单</div>'; return; }
+  box.innerHTML = orders.map(o => {
+    const pct = Math.max(0, Math.min(100, o.progress || 0));
+    const cls = (o.status === 'done' || o.status === 'failed' || o.status === 'need_manual')
+      ? o.status : 'active';
+    const rawMsg = (o.text || '').trim();
+    const msg = rawMsg.length > 160 ? rawMsg.slice(0, 160) + '…' : rawMsg;
+    const title = o.title ? `<div class="meta">标题：<b>${esc(o.title)}</b></div>` : '';
+    const src = o.chosen_url
+      ? `<div class="meta">源：<a href="${esc(o.chosen_url)}" target="_blank" rel="noopener">${esc(o.chosen_url.slice(0,110))}</a></div>`
+      : '';
+    const file = o.file_path
+      ? `<div class="meta">文件：${esc(o.file_path.split(/[\\/]/).pop())} · ${fmtSize(o.file_size)}</div>` : '';
+    const err = o.error ? `<div class="meta" style="color:var(--warn)">${esc(o.error)}</div>` : '';
+    const ev = (o.events || []).length;
+
+    return `<div class="order ${cls}">
+      <div class="order-head">
+        <span class="st ${o.status}">${esc(o.status_label)}</span>
+        <span class="oid">#${o.id} · ${esc(o.channel)}</span>
+        <span class="who">${esc(o.sender || o.conversation_id || '')} · ${esc(o.stage || '')}</span>
+      </div>
+      <div class="msg">${esc(msg)}</div>
+      <div class="bar ${cls}"><i style="width:${pct}%"></i></div>
+      ${title}${src}${file}${err}
+      ${o.reply ? `<div class="reply"><div class="reply-txt">${esc(o.reply)}</div></div>` : ''}
+      <div class="acts">
+        ${o.reply ? `<button class="tiny" onclick="copyReply(${o.id})">📋 复制回话</button>` : ''}
+        ${o.file_path ? `<button class="tiny ghost" onclick="downloadFile(${o.id})">⬇ 取文件</button>` : ''}
+        ${o.file_path ? `<button class="tiny ghost" onclick="revealFile(${o.id})" title="${esc(o.file_path)}">📂 打开文件夹</button>` : ''}
+        ${(o.status === 'failed' || o.status === 'need_manual')
+          ? `<button class="tiny ghost" onclick="act(${o.id},'retry','已重新排队')">↻ 重试</button>` : ''}
+        ${cls === 'active'
+          ? `<button class="tiny ghost" onclick="act(${o.id},'cancel','已取消')">✕ 取消</button>` : ''}
+        <button class="tiny ghost" onclick="toggleDetail(${o.id})">📜 日志</button>
+      </div>
+      <pre id="log-${o.id}" style="display:none"></pre>
+    </div>`;
+  }).join('');
+}
+
+async function toggleDetail(id){
+  const el = document.getElementById('log-' + id);
+  if(el.style.display !== 'none'){ el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  el.textContent = '加载中…';
+  try{
+    const r = await fetch(apiUrl('/api/orders/' + id));
+    const d = await r.json();
+    const lines = (d.events || []).map(e => {
+      const t = new Date(e.ts * 1000).toLocaleTimeString('zh-CN', {hour12:false});
+      return `[${t}] ${e.level.toUpperCase().padEnd(5)} ${e.message}`;
+    });
+    const head = `订单 #${d.id}  状态=${d.status}  引擎流程=${d.stage}\n`
+      + `识别到 ${(d.links||[]).length} 条链接\n` + '-'.repeat(60) + '\n';
+    el.textContent = head + (lines.join('\n') || '（暂无日志）');
+  }catch(e){ el.textContent = '读取日志失败：' + e.message; }
+}
+
+document.getElementById('text').addEventListener('keydown', ev => {
+  if(ev.ctrlKey && ev.key === 'Enter') submitOrder();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

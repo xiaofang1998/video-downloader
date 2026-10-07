@@ -1,0 +1,22 @@
+[project]
+name = "xianyu-video-bot"
+version = "0.1.0"
+description = "视频代下载接单流水线：链接识别 / 落源搜索 / 下载 / 回话生成"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "yt-dlp>=2024.7.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.uv]
+# 不作为包安装：`uv run run.py` 直接以项目根目录为工作目录，import xydl 即可用
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# package = false 时项目不会被装进 site-packages，靠这个让 `import xydl` 找得到
+pythonpath = ["."]
