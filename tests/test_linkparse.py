@@ -34,6 +34,22 @@ from xydl.linkparse import (
     ("https://v.qq.com/x/cover/a.html", "tencent_video"),
     ("https://m.tb.cn/h.5xYz", "xianyu"),
     ("https://example.com/x", None),
+    # ── 新增平台：国内社区视频 ──────────────────────────────────
+    ("https://www.acfun.cn/v/ac12345", "acfun"),
+    ("https://www.acfun.com/v/ac12345", "acfun"),
+    # ── 新增平台：海外社区视频 / 短视频 ─────────────────────────
+    ("https://www.reddit.com/r/funny/comments/abc/", "reddit"),
+    ("https://redd.it/abc", "reddit"),
+    ("https://rumble.com/v1234.html", "rumble"),
+    ("https://streamable.com/abc", "streamable"),
+    ("https://www.nicovideo.jp/watch/sm12345", "niconico"),
+    ("https://nico.ms/sm12345", "niconico"),
+    ("https://9gag.com/gag/abc", "9gag"),
+    ("https://coub.com/view/abc", "coub"),
+    # ── 新增平台：音频 / 播客 / 音乐 ────────────────────────────
+    ("https://soundcloud.com/user/track", "soundcloud"),
+    ("https://bandcamp.com/track/abc", "bandcamp"),
+    ("https://www.mixcloud.com/user/track/", "mixcloud"),
 ])
 def test_detect_platform(url, expected):
     rule = detect_platform(url)
@@ -222,6 +238,31 @@ def test_additional_short_domains(url, expected):
     rule = detect_platform(url)
     assert rule is not None and rule.key == expected
     assert is_short_link(url) is True
+
+
+# ── 新增平台：类型判定与短链 ────────────────────────────────────────
+@pytest.mark.parametrize("url,kind", [
+    # 新视频平台都是普通「页面」链接，走 yt-dlp 全流程，不该被判成 DRM 或误判短链
+    ("https://www.acfun.cn/v/ac12345", "page"),
+    ("https://www.reddit.com/r/funny/comments/abc/", "page"),
+    ("https://rumble.com/v1234.html", "page"),
+    ("https://streamable.com/abc", "page"),
+    ("https://www.nicovideo.jp/watch/sm12345", "page"),
+    ("https://9gag.com/gag/abc", "page"),
+    ("https://coub.com/view/abc", "page"),
+    ("https://soundcloud.com/user/track", "page"),
+    ("https://bandcamp.com/track/abc", "page"),
+    ("https://www.mixcloud.com/user/track/", "page"),
+])
+def test_new_platforms_are_page_not_drm(url, kind):
+    top = extract_links(url)[0]
+    assert top.kind == kind
+    assert top.kind != "drm"
+
+
+def test_nico_short_domain_expands():
+    """nico.ms 是 Niconico 的短链域名，应判为 short 而非 page。"""
+    assert is_short_link("https://nico.ms/sm12345") is True
 
 
 # ── 端到端解析 ────────────────────────────────────────────────────────

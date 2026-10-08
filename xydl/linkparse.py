@@ -127,6 +127,21 @@ PLATFORMS: tuple[PlatformRule, ...] = (
                  short_domains=("dai.ly",)),
     PlatformRule("twitch", "Twitch", ("twitch.tv",)),
     PlatformRule("biliintl", "bilibili 国际版", ("biliintl.com",)),
+    # ── 国内社区视频 ────────────────────────────────────────────────
+    PlatformRule("acfun", "AcFun 弹幕", ("acfun.cn", "acfun.com")),
+    # ── 海外社区视频 / 短视频 ──────────────────────────────────────
+    PlatformRule("reddit", "Reddit", ("reddit.com", "redd.it")),
+    PlatformRule("rumble", "Rumble", ("rumble.com",)),
+    PlatformRule("streamable", "Streamable", ("streamable.com", "streamablemedia.com")),
+    PlatformRule("niconico", "Niconico",
+                 ("nicovideo.jp", "nico.ms", "nicodic.jp"),
+                 short_domains=("nico.ms",)),
+    PlatformRule("9gag", "9GAG", ("9gag.com",)),
+    PlatformRule("coub", "Coub", ("coub.com",)),
+    # ── 音频 / 播客 / 音乐平台（下载产物是 mp3/m4a 等音频文件）──────
+    PlatformRule("soundcloud", "SoundCloud", ("soundcloud.com", "sndcdn.com")),
+    PlatformRule("bandcamp", "Bandcamp", ("bandcamp.com",)),
+    PlatformRule("mixcloud", "Mixcloud", ("mixcloud.com",)),
     # ── 电商 / 闲鱼自家（多半是买家发错）─────────────────────────
     PlatformRule("xianyu", "闲鱼/淘宝",
                  ("goofish.com", "2.taobao.com", "taobao.com", "tmall.com"),

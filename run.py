@@ -545,6 +545,20 @@ _EXTRACTOR_KEYS: dict[str, str] = {
     "iqiyi": "iqiyi",
     "youku": "youku",
     "mgtv": "mgtv",
+    "biliintl": "biliintl",
+    # ── 国内社区视频 ────────────────────────────────────────────────
+    "acfun": "acfun",
+    # ── 海外社区视频 / 短视频 ──────────────────────────────────────
+    "reddit": "reddit",
+    "rumble": "rumble",
+    "streamable": "streamable",
+    "niconico": "niconico",
+    "9gag": "9gag",
+    "coub": "coub",
+    # ── 音频 / 播客 / 音乐平台 ────────────────────────────────────
+    "soundcloud": "soundcloud",
+    "bandcamp": "bandcamp",
+    "mixcloud": "mixcloud",
 }
 
 
