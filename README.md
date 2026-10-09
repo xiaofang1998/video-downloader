@@ -67,6 +67,10 @@ start.bat serve           :: 启动接单服务（无参数时默认就是它）
 
 启动成功后打开 <http://127.0.0.1:8765/>。
 
+> 💡 想下载**抖音 / TikTok / 快手**？这三个平台需要 TikHub key 或登录态，
+> 见下文「抖音 / TikTok / 快手：走 TikHub 或登录态」。B站 / YouTube / 小红书等
+> 开箱即用，不用额外配置。
+
 ### 起不来怎么办
 
 ```bat
@@ -112,17 +116,46 @@ start.bat doctor   :: 应该看到「ffmpeg 已启用  <路径>」
 
 ---
 
-## 抖音 / 小红书下不了？需要配 Cookie
+## 抖音 / TikTok / 快手：走 TikHub 或登录态
 
-抖音和小红书有**反爬风控**，偶发情况下 yt-dlp 会报：
+这三个平台现在是 **`a_bogus` 请求签名**风控，yt-dlp 的解析器已经过时——带不带
+cookie 都没用（实测返回 `403 Uifid Not Found`）。本地逆向签名不现实，所以走两条路：
+
+### 主力：TikHub 第三方解析（推荐）
+
+[TikHub.io](https://tikhub.io) 在服务端维护了抖音/TikTok/快手的签名算法，一次
+API 调用直接返回无水印直链，最省心：
+
+1. 注册 <https://user.tikhub.io>（邮箱即可）
+2. Dashboard 顶部点 **Check-in** 签到领每日免费额度（不签到可能下不了）
+3. 左侧 **API Management → Pricing** 创建 API key，勾选**全部 Scopes** 保存
+4. 把 key 填进 `config.json`：
+
+```jsonc
+{ "delivery": { "tikhub": { "api_key": "你的key" } } }
+```
+
+填完重启即可。免费档按签到额度走，量大需付费。
+
+### 兜底：登录态（TikHub 额度不够时）
+
+工具内置「登录态兜底」：双击 exe 后顶部有 **🔑 登录抖音 / 🔑 登录TikTok** 按钮，
+点一下弹 Edge 扫码登录（登录态存在工具自己的 profile 里，与日常浏览器隔离）。
+之后 TikHub 额度用完时，会自动切到这个登录态本地解析。
+
+命令行等价操作：`start.bat cdp-login douyin`（或 `tiktok`）。
+
+---
+
+## 小红书 / 西瓜下不了？需要配 Cookie
+
+小红书和西瓜有反爬风控，偶发情况下 yt-dlp 会报：
 
 ```
 ERROR: [Douyin] xxxx: Fresh cookies (not necessarily logged in) are needed
 ```
 
-注意这**不是「要你登录」**——抖音/小红书大多时候不带 cookie 也能下；被风控时
-只要**带上游客 cookie**（浏览器访问一次抖音/小红书即可，不用登录账号）就能恢复。
-西瓜视频则是基本必须配 cookie。
+小红书大多时候不带 cookie 也能下，被风控时带游客 cookie 即可；西瓜视频基本必须配。
 
 ### 配置步骤
 
@@ -132,7 +165,7 @@ ERROR: [Douyin] xxxx: Fresh cookies (not necessarily logged in) are needed
 start.bat cookies
 ```
 
-它会列出每个浏览器 profile 里有没有抖音/小红书的 cookie，**以及 cookie 用的是什么加密**。
+它会列出每个浏览器 profile 里有没有目标站点的 cookie，**以及 cookie 用的是什么加密**。
 然后两条路：
 
 #### 路线一：cookies.txt（最可靠，推荐）
@@ -147,7 +180,7 @@ Chrome / Edge 从 **127 版**起对 cookie 启用了 **App-Bound 加密**，yt-d
 4. 改 `config.json`：
 
 ```jsonc
-{ "download": { "cookies_file": "C:/Users/libofang/Documents/xianyu-video-bot/cookies.txt" } }
+{ "download": { "cookies_file": "C:/path/to/cookies.txt" } }
 ```
 
 `run.py cookies` 会告诉你当前 cookie 是 `v10`（yt-dlp 能解）还是 `v20`（解不开）。
@@ -158,24 +191,13 @@ Chrome / Edge 从 **127 版**起对 cookie 启用了 **App-Bound 加密**，yt-d
 必须先完全关闭浏览器（含托盘/后台进程）。
 
 ```bat
-start.bat login douyin --test "https://v.douyin.com/xxxx/"
+start.bat login xiaohongshu --test "https://www.xiaohongshu.com/explore/xxxx"
 ```
 
 这条命令会自动：检测浏览器是否还开着并**等它关闭** → 读 cookie → 写好配置 →
 用给定的链接**当场验证**能不能解析。看到 `✅ 解析成功` 就是通了。
 
 指定浏览器用 `--browser chrome`，只检查不配置用 `--check`。
-
-### 备选：用 cookies.txt
-
-本机浏览器不方便时（比如在另一台机器上登录），可以用浏览器扩展导出
-Netscape 格式的 `cookies.txt`，然后：
-
-```jsonc
-{ "download": { "cookies_file": "C:/path/to/cookies.txt" } }
-```
-
-`cookies_file` 优先于 `cookies_from_browser`。
 
 > **说明**：这条路用的是 yt-dlp 官方支持的 cookie 读取能力 —— 也就是你**自己的
 > 浏览器会话**。本项目不包含任何针对特定平台风控、或针对 Cloudflare / Turnstile
@@ -342,6 +364,7 @@ start.bat parse "买家消息原文"                     :: 只看链接识别�
 start.bat resolve https://b23.tv/xxx             :: 只做短链展开
 start.bat resolve -q "猫咪打呼噜合集"              :: 只用标题落源
 start.bat download https://www.bilibili.com/video/BVxxx
+start.bat cdp-login douyin                        :: 登录抖音（登录态兜底，TikHub 额度不够时用）
 start.bat doctor                                 :: 环境自检
 start.bat selftest                               :: 离线端到端自测
 ```
@@ -668,6 +691,10 @@ upstream_patch/
 
 单文件的好处是拷贝/分发就是拷一个 exe，没有「哪个目录忘了带就起不来」的问题。
 用户第一次运行会在 exe 同级生成 `config.json` / `data` / `downloads` / `logs`。
+
+> 分发给买家时，抖音/TikTok/快手有两种玩法：① 你把 TikHub key 统一配进 exe 旁的
+> `config.json`（买家零操作）；② 让买家自己点界面上的「登录抖音/登录TikTok」走登录态兜底。
+> 其余平台开箱即用。
 
 ### 几个设计上的取舍
 
