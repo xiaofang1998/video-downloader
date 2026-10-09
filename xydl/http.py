@@ -10,9 +10,11 @@ import gzip
 import json
 import socket
 import ssl
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zlib
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -34,35 +36,103 @@ DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 #:   ``"http://host:port"`` → 走指定代理
 SYSTEM_PROXY = None
 
-#: 配置里 ``net.proxy`` 的写法 → 上面三态
+#: 配置里 ``net.proxy`` 的写法：这三类 → 跟随系统代理（解析成具体地址）
 _PROXY_AUTO = {"", "auto", "system", "default", "inherit"}
 _PROXY_OFF = {"none", "direct", "off", "no", "-"}
+
+
+def _parse_proxy_server(server: str) -> str:
+    """把注册表 ``ProxyServer`` 字符串解析成 http(s) 代理地址。
+
+    两种写法：``127.0.0.1:7897``（混合端口）或
+    ``http=127.0.0.1:7890;https=127.0.0.1:7890;socks=127.0.0.1:7891``。
+    返回空串表示解析不出来。
+    """
+    server = server.strip()
+    if not server:
+        return ""
+    if "=" in server:
+        parts = {}
+        for chunk in server.split(";"):
+            chunk = chunk.strip()
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                parts[k.strip().lower()] = v.strip()
+        for proto in ("https", "http"):
+            addr = parts.get(proto)
+            if addr:
+                return addr if "://" in addr else f"http://{addr}"
+        return ""
+    return server if "://" in server else f"http://{server}"
+
+
+def _winreg_system_proxy() -> str:
+    """读 Windows 系统代理（WinINET 的 Internet Settings）。
+
+    Clash / v2rayN 等工具「开启系统代理」写的就是这个注册表项，是 Windows
+    上「系统代理」的**权威**来源。环境变量里可能有残留/被注入的旧代理地址
+    （实测踩过：环境变量里 `127.0.0.1:60387` 是个已死的端口，而真正在听的
+    Clash 是 7897），所以这里优先读注册表，读不到才退回环境变量。
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+    except ImportError:  # 非 Windows 运行时不会走到这里，纯防御
+        return ""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        )
+    except OSError:
+        return ""
+    try:
+        try:
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+        except OSError:
+            return ""
+        if not enabled:
+            return ""
+        try:
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+        except OSError:
+            return ""
+    finally:
+        winreg.CloseKey(key)
+    return _parse_proxy_server(str(server))
 
 
 def parse_proxy_spec(spec: object) -> str | None:
     """把配置文件里的代理写法翻译成 :func:`request` 认识的三态。
 
-    >>> parse_proxy_spec("") is None       # 默认：跟随系统代理
-    True
-    >>> parse_proxy_spec("auto") is None
-    True
+    ``""`` / ``"auto"`` 跟随系统代理（解析成具体地址），``"none"`` 强制直连，
+    其余原样返回。
+
     >>> parse_proxy_spec("none")           # 强制直连
     ''
     >>> parse_proxy_spec("http://127.0.0.1:7890")
     'http://127.0.0.1:7890'
     """
     if spec is None:
-        return SYSTEM_PROXY
+        return system_proxy_url()
     value = str(spec).strip()
     if value.lower() in _PROXY_AUTO:
-        return SYSTEM_PROXY
+        return system_proxy_url()
     if value.lower() in _PROXY_OFF:
         return ""
     return value
 
 
 def system_proxy_url() -> str:
-    """读出系统代理的 https/http 地址（yt-dlp 要显式喂给它，它不读注册表）。"""
+    """读出系统代理的 https/http 地址（yt-dlp 要显式喂给它，它不读注册表）。
+
+    优先读 Windows 注册表（权威系统代理）；读不到再退回环境变量。
+    返回空串表示「没有可用系统代理」——调用方按直连处理。
+    """
+    reg = _winreg_system_proxy()
+    if reg:
+        return reg
     try:
         proxies = urllib.request.getproxies()
     except Exception:  # noqa: BLE001 - 读不到代理不算错误
@@ -315,3 +385,63 @@ def post_json(url: str, json_body: Any, **kwargs: Any) -> Any:
         return resp.json()
     except json.JSONDecodeError as exc:
         raise HttpError(f"响应不是合法 JSON：{exc}", resp.url, resp.status) from exc
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  multipart/form-data（网盘分片上传要用）
+# ══════════════════════════════════════════════════════════════════════
+def encode_multipart(
+    fields: Mapping[str, Any] | None = None,
+    files: list[tuple[str, str, bytes]] | None = None,
+    boundary: str = "",
+) -> tuple[bytes, str]:
+    """把普通字段 + 文件字段拼成 multipart/form-data 请求体。
+
+    ``files`` 每项是 ``(字段名, 文件名, 内容)``。内容一律按二进制处理 ——
+    网盘分片不需要给服务端猜 MIME。
+    """
+    boundary = boundary or f"----xydl{uuid.uuid4().hex}"
+    out = bytearray()
+    for key, value in (fields or {}).items():
+        if value is None:
+            continue
+        out += f"--{boundary}\r\n".encode()
+        out += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+        out += f"{value}\r\n".encode()
+    for field_name, filename, content in files or []:
+        out += f"--{boundary}\r\n".encode()
+        out += (
+            f'Content-Disposition: form-data; name="{field_name}"; '
+            f'filename="{filename}"\r\n'
+        ).encode()
+        out += b"Content-Type: application/octet-stream\r\n\r\n"
+        out += content
+        out += b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return bytes(out), boundary
+
+
+def post_multipart(
+    url: str,
+    *,
+    fields: Mapping[str, Any] | None = None,
+    files: list[tuple[str, str, bytes]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    timeout: float = 60.0,
+    proxy: str | None = None,
+    verify_tls: bool = True,
+    user_agent: str = DEFAULT_UA,
+) -> Response:
+    """POST 一个 multipart 表单（分片上传用）。
+
+    刻意**不跟随重定向**：上传接口重定向基本都意味着鉴权/域名错了，
+    静默跟过去只会把大文件重复传一遍然后报一个莫名其妙的错。
+    """
+    body, boundary = encode_multipart(fields, files)
+    send_headers = dict(headers or {})
+    send_headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    return request(
+        "POST", url, data=body, headers=send_headers, timeout=timeout,
+        proxy=proxy, verify_tls=verify_tls, user_agent=user_agent,
+        max_bytes=DEFAULT_MAX_BYTES,
+    )

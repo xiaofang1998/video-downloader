@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import linkparse
-from .config import Config
+from .config import Config, app_dir, bundle_dir
 from .http import HttpError, open_stream, parse_proxy_spec, system_proxy_url
 from .models import DownloadResult, human_size
 from .utils import clean_media_title, ensure_unique, sanitize_filename
@@ -99,10 +99,10 @@ _ERROR_HINTS = (
      "cookie 反而会触发风控。把 download.cookie_mode 保持 auto（YouTube 不在 "
      "cookie_domains 里），或把 youtube.com 从 cookie_domains 里去掉"),
     (re.compile(r"Cookies? .{0,40}are needed", re.I),
-     "该站点要求携带浏览器 cookie（抖音/西瓜/微博这类站点的常规风控，不是登录问题）。"
-     "跑 `run.py login <站点>` 配一下，或改用 download.cookies_file。"
-     "注意 cookie 是**站点特定**的：别把它发给 YouTube/TikTok，那些站点带了"
-     "别的会话的 cookie 反而会被风控拒绝"),
+     "该站点风控要求带 cookie（**不一定是要登录**）：抖音/小红书通常浏览器访问一次、"
+     "生成游客 cookie 就能下，西瓜/微博才可能真要登录。跑 `run.py login <站点>` 配一下，"
+     "或改用 download.cookies_file。注意 cookie 是**站点特定**的：别把它发给 "
+     "YouTube/TikTok，那些站点带了别的会话的 cookie 反而会被风控拒绝"),
     (re.compile(r"Private video|login required|Sign in to confirm|需要登录|"
                 r"Login required|account.*required", re.I),
      "这个内容需要登录才能访问。配置 download.cookies_from_browser（如 \"edge\"）"
@@ -137,6 +137,22 @@ _FORMAT_RETRYABLE = re.compile(
 )
 
 
+def _ytdlp_argv_prefix() -> list[str]:
+    """怎么把 yt-dlp 叫起来。
+
+    **打包成桌面应用后 ``sys.executable`` 是应用自己，不是 Python。**
+    原来直接写 ``[sys.executable, "-m", "yt_dlp"]``，冻结后就等于
+    「启动 视频下载工具.exe -m yt_dlp」—— 应用把自己再跑一遍，main() 又执行一次、
+    又去探测 yt-dlp、又启动一次自己……实测一次双击炸出 50+ 个进程。
+
+    所以冻结环境下走一个专用入口 ``--run-yt-dlp``，
+    由 desktop.py 把这个参数接住并转交给 yt-dlp。
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--run-yt-dlp"]
+    return [sys.executable, "-m", "yt_dlp"]
+
+
 class YtDlpEngine:
     """封装 ``yt-dlp`` 命令行。
 
@@ -168,16 +184,26 @@ class YtDlpEngine:
     def _resolve_base_cmd(self) -> list[str] | None:
         if self._base_cmd is not None:
             return self._base_cmd or None
-        # 1) 当前解释器里能不能 import yt_dlp
+
+        prefix = _ytdlp_argv_prefix()
+
+        # 1) 当前环境里能不能跑 yt-dlp
+        if getattr(sys, "frozen", False):
+            # 打包后没法「import yt_dlp 试试」——sys.executable 是我们自己。
+            # 用 yt-dlp 的 --version 既验证可用、又顺手拿到版本号。
+            probe_args = [*prefix, "--version"]
+        else:
+            probe_args = [sys.executable, "-c",
+                          "import yt_dlp; print(yt_dlp.version.__version__)"]
         try:
             probe = subprocess.run(
-                [sys.executable, "-c", "import yt_dlp; print(yt_dlp.version.__version__)"],
+                probe_args,
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=30, env=self._child_env(),
+                timeout=60, env=self._child_env(),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            if probe.returncode == 0:
-                self._base_cmd = [sys.executable, "-m", "yt_dlp"]
+            if probe.returncode == 0 and (probe.stdout or "").strip():
+                self._base_cmd = prefix
                 self.version = (probe.stdout or "").strip()
                 return self._base_cmd
         except (OSError, subprocess.SubprocessError):
@@ -300,6 +326,13 @@ class YtDlpEngine:
             if found:
                 add(found)
 
+        # 随包发的 ffmpeg：打包成桌面应用时会放在 exe 同级的 ffmpeg/ 目录里。
+        # 排在 PATH **之前** —— 这是我们特意带进来的、版本可控；
+        # 用户机器上 PATH 里那个可能是残缺的旧版本，甚至是个跑不起来的 shim。
+        for base in (app_dir() / "ffmpeg", bundle_dir() / "ffmpeg"):
+            for name in ("ffmpeg.exe", "ffmpeg"):
+                add(base / name)
+
         for base in self._ffmpeg_search_dirs():
             for name in ("ffmpeg.exe", "ffmpeg"):
                 add(base / name)
@@ -363,9 +396,9 @@ class YtDlpEngine:
     def _cookie_args(self, url: str = "") -> list[str]:
         """cookie 相关参数，**按目标域名决定发不发**。
 
-        cookie 是站点特定的：抖音/西瓜不带就下不了，而 YouTube 带了别的浏览器
-        会话的 cookie 会被判风控（"The page needs to be reloaded"）。实测过，
-        全局无脑下发 cookie 会把本来能下的 YouTube 弄挂。
+        cookie 是站点特定的：西瓜不带就下不了，抖音/小红书配了游客 cookie 更稳，
+        而 YouTube 带了别的浏览器会话的 cookie 会被判风控（"The page needs to
+        be reloaded"）。实测过，全局无脑下发 cookie 会把本来能下的 YouTube 弄挂。
         """
         if not self._cookies_wanted(url):
             return []
@@ -674,9 +707,18 @@ class YtDlpEngine:
         ), raw_log
 
     @staticmethod
+    @staticmethod
     def _clean_job_dir(job_dir: Path) -> None:
-        """换格式重试前清场，避免上一次的半截文件被误认为成品。"""
-        for item in job_dir.iterdir():
+        """清空任务目录里的成品文件。
+
+        用于两处：换格式重试前（清掉半截文件）、以及新任务开始前
+        （清掉上一次残留，避免被 ``_locate_output`` 的「取最大文件」误判）。
+        """
+        try:
+            items = list(job_dir.iterdir())
+        except OSError:
+            return
+        for item in items:
             if not item.is_file():
                 continue
             try:
@@ -890,6 +932,101 @@ class HttpEngine:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  快手（yt-dlp 已移除其解析器，自研 GraphQL 兜底）
+# ══════════════════════════════════════════════════════════════════════
+_KUAISHOU_HOSTS = ("kuaishou.com", "gifshow.com", "kwai.com")
+
+_KUAISHOU_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+
+def is_kuaishou(url: str) -> bool:
+    """是不是快手链接（含短链 v.kuaishou.com）。"""
+    host = (linkparse.host_of(url) or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _KUAISHOU_HOSTS)
+
+
+def _is_douyin(url: str) -> bool:
+    host = (linkparse.host_of(url) or "").lower()
+    return host == "douyin.com" or host.endswith((".douyin.com", "iesdouyin.com"))
+
+
+def _is_tiktok(url: str) -> bool:
+    host = (linkparse.host_of(url) or "").lower()
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+_COOKIE_NEEDED_RE = re.compile(r"cookie", re.I)
+
+
+def _needs_cookie(error: str) -> bool:
+    """错误是不是「需要 cookie」这一类（抖音/小红书风控）的信号。"""
+    return bool(error) and bool(_COOKIE_NEEDED_RE.search(error))
+
+
+def kuaishou_photo_url(url: str) -> tuple[str, str]:
+    """快手无水印直链 + 标题。失败返回 ``("", "")``。
+
+    流程：短链展开 → 提 photoId → 访问首页拿 ``did`` cookie →
+    GraphQL ``visionVideoDetail`` 拿 ``photoUrl``（无水印播放源）。
+
+    **尽力而为**：快手反爬靠 ``did`` 设备指纹，太「新鲜」的 did 会被滑块拦截
+    （GraphQL 返回 ``result=400002`` + captcha）。能拿到就拿，拿不到由上层报错。
+    """
+    import http.cookiejar
+    import urllib.request as ur
+
+    try:
+        final = url
+        host = (linkparse.host_of(url) or "").lower()
+        if "v.kuaishou.com" in host or host.endswith("gifshow.com"):
+            from .http import request
+            resp = request("GET", url, proxy="", follow=True, timeout=15,
+                           user_agent=_KUAISHOU_UA)
+            final = resp.url or url
+
+        m = re.search(r"short-video/([0-9A-Za-z]+)", final)
+        if not m:
+            return "", ""
+        photo_id = m.group(1)
+
+        # 访问首页拿 did（快手国内直连）
+        cj = http.cookiejar.CookieJar()
+        opener = ur.build_opener(ur.HTTPCookieProcessor(cj))
+        opener.open(ur.Request("https://www.kuaishou.com/",
+                               headers={"User-Agent": _KUAISHOU_UA}), timeout=15)
+        cookies = {c.name: c.value for c in cj}
+
+        query = (
+            "query visionVideoDetail($photoId: String, $page: String) { "
+            "visionVideoDetail(photoId: $photoId, page: $page) { "
+            "photo { id caption photoUrl coverUrl } } }"
+        )
+        body = {"operationName": "visionVideoDetail",
+                "variables": {"photoId": photo_id, "page": "detail"},
+                "query": query}
+        req = ur.Request(
+            "https://www.kuaishou.com/graphql",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "User-Agent": _KUAISHOU_UA,
+                "Content-Type": "application/json",
+                "Referer": f"https://www.kuaishou.com/short-video/{photo_id}",
+                "Origin": "https://www.kuaishou.com",
+                "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+            },
+        )
+        r = opener.open(req, timeout=15)
+        data = json.loads(r.read().decode("utf-8", "replace"))
+        photo = ((data.get("data") or {}).get("visionVideoDetail") or {}).get("photo") or {}
+        return str(photo.get("photoUrl") or ""), str(photo.get("caption") or "")
+    except Exception:
+        return "", ""
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  门面
 # ══════════════════════════════════════════════════════════════════════
 class Downloader:
@@ -920,8 +1057,40 @@ class Downloader:
         直链的 ``.mp4`` 用 yt-dlp 也是对的（它内部走 HTTP 并顺带拿元数据），
         所以这里不必按 kind 分叉，一路降级到底即可。
         """
+        job_dir = Path(job_dir)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        # job_dir 是「单任务独享」目录：开跑前先清场。否则上一次任务残留的
+        # 成品文件，会被 _locate_output 的「取最大文件」兜底误判成本次产物 ——
+        # 真踩过：抖音下失败，把上一次 YouTube 留下的 Bow.mp4 当成本次成功。
+        self.ytdlp._clean_job_dir(job_dir)
+
         attempts: list[str] = []
         cancelled = lambda: cancel is not None and cancel.is_set()  # noqa: E731
+
+        # 抖音/TikTok/快手：yt-dlp 已过时（a_bogus 签名），优先走 TikHub 第三方解析，
+        # TikHub 失败/没配 key 时，抖音/TikTok 降级到「登录态 CDP」本地解析。
+        tikhub_key = str(self.config.get("delivery.tikhub.api_key", "") or "").strip()
+        if _is_douyin(url) or _is_tiktok(url) or is_kuaishou(url):
+            direct, caption = "", ""
+            if tikhub_key:
+                from .tikhub import resolve as tikhub_resolve
+                direct, caption = tikhub_resolve(url, tikhub_key)
+            # 抖音/TikTok 兜底：登录态 CDP（复用买家登录过的 profile）
+            if not direct and (_is_douyin(url) or _is_tiktok(url)):
+                from .cdp_fetch import fetch_douyin_video, login_profile_dir
+                platform = "douyin" if _is_douyin(url) else "tiktok"
+                profile = login_profile_dir(platform)
+                if profile.exists():
+                    direct, caption = fetch_douyin_video(url, profile)
+            if direct:
+                hint = title_hint or clean_media_title(caption, 60)
+                result = self.http.download(direct, job_dir, title_hint=hint,
+                                            progress=progress, cancel=cancel)
+                if result.ok or cancelled():
+                    return result
+                attempts.append(f"解析直链：{result.error}")
+            else:
+                attempts.append("抖音/TikTok：TikHub 未配/失败，且无登录态（需先登录一次）")
 
         if self.prefer_ytdlp and self.ytdlp.available:
             result = self.ytdlp.download(url, job_dir, title_hint=title_hint,
@@ -929,6 +1098,30 @@ class Downloader:
             if result.ok or cancelled():
                 return result
             attempts.append(f"yt-dlp：{result.error}")
+            # 需要 cookie 但还没配 → 静默读本机浏览器里的游客 cookie 再试一次。
+            # 抖音/小红书这类站点：买家多半用浏览器刷过，游客 cookie 已经在
+            # 浏览器里了，读出来就能下，不用逼用户去配。
+            if (_needs_cookie(result.error)
+                    and not (self.ytdlp.cookies_file or self.ytdlp.cookies_from_browser)):
+                retry = self._retry_with_browser_cookies(
+                    url, job_dir, title_hint, progress, cancel)
+                if retry is not None:
+                    if retry.ok or cancelled():
+                        return retry
+                    attempts.append(f"读浏览器 cookie 重试：{retry.error}")
+
+        # 快手：yt-dlp 已移除解析器，走自研 GraphQL 拿直链再下载
+        if is_kuaishou(url):
+            direct, caption = kuaishou_photo_url(url)
+            if direct:
+                hint = title_hint or clean_media_title(caption, 60)
+                result = self.http.download(direct, job_dir, title_hint=hint,
+                                            progress=progress, cancel=cancel)
+                if result.ok or cancelled():
+                    return result
+                attempts.append(f"快手直链：{result.error}")
+            else:
+                attempts.append("快手：解析被风控拦截（需浏览器访问一次快手后重试）")
 
         result = self.http.download(url, job_dir, title_hint=title_hint,
                                     progress=progress, cancel=cancel)
@@ -942,6 +1135,60 @@ class Downloader:
             attempts.insert(0, "配置里关闭了 prefer_ytdlp")
 
         return DownloadResult(False, engine="", error="；".join(attempts))
+
+    def _retry_with_browser_cookies(self, url: str, job_dir: Path, title_hint: str,
+                                    progress: ProgressCallback,
+                                    cancel: threading.Event | None):
+        """读浏览器 cookie 重试；抖音再降级到 CDP 拿明文 cookie。无路可走返回 None。
+
+        1) 静默读本机浏览器（Edge/Chrome/火狐）cookie 重试 —— 买家刷过抖音的话
+           游客 cookie 已经在里面了。
+        2) 抖音且浏览器 cookie 也失败：Edge 127+ 的 cookie 是 App-Bound v20 加密
+           yt-dlp 解不开，所以用 CDP 让 Edge 自己吐出明文 cookie（会弹个 Edge 窗口）。
+        """
+        try:
+            browsers = self.ytdlp.detect_browsers()
+        except Exception:  # noqa: BLE001 - 探测失败就当没有
+            browsers = []
+        for browser in browsers:
+            saved = self.ytdlp.cookies_from_browser
+            self.ytdlp.cookies_from_browser = browser
+            try:
+                r = self.ytdlp.download(url, job_dir, title_hint=title_hint,
+                                        progress=progress, cancel=cancel)
+                if r.ok or (cancel is not None and cancel.is_set()):
+                    return r
+            finally:
+                self.ytdlp.cookies_from_browser = saved
+
+        if _is_douyin(url):
+            return self._retry_with_cdp_cookies(url, job_dir, title_hint, progress, cancel)
+        return None
+
+    def _retry_with_cdp_cookies(self, url: str, job_dir: Path, title_hint: str,
+                                progress: ProgressCallback,
+                                cancel: threading.Event | None):
+        """抖音专属：CDP 启动 Edge 拿明文 cookie 重试。失败返回 None。"""
+        from .cdp_cookies import cookies_to_netscape, douyin_guest_cookies
+
+        cookies = douyin_guest_cookies(url)
+        if not cookies:
+            return None
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="xydl_dy_")
+        os.close(fd)
+        Path(path).write_text(cookies_to_netscape(cookies), encoding="utf-8")
+        saved = self.ytdlp.cookies_file
+        self.ytdlp.cookies_file = path
+        try:
+            return self.ytdlp.download(url, job_dir, title_hint=title_hint,
+                                       progress=progress, cancel=cancel)
+        finally:
+            self.ytdlp.cookies_file = saved
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def job_dir_for(root: str | Path, order_id: int | str) -> Path:

@@ -15,3 +15,21 @@ logs/
 # 本地密钥，永远不要提交
 .env
 secrets.json
+
+# 本地密钥，永远不要提交
+.env
+secrets.json
+
+# 打包产物（dist 里的 exe 太大，且含 config）
+build/
+dist/
+
+# 临时脚本 / 工作记忆
+.scratch/
+.workbuddy/
+
+# 登录态 profile（含用户登录信息，绝不能提交）
+browser-login/
+
+# 克隆的上游项目（第三方，不属于本仓库）
+xianyu-super-butler/

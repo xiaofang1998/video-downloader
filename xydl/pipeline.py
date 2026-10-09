@@ -37,6 +37,12 @@ Deliverer = Callable[[Order, str, str], None]
 #: 进度落库的最小间隔，避免把 SQLite 写爆
 STORE_PROGRESS_INTERVAL = 0.5
 
+#: 塞进队列用来立刻唤醒卡在 get() 上的 worker。
+#: worker 用 ``queue.get(timeout=0.5)`` 轮询等待，所以不发这个信号的话，
+#: stop() 里每个 worker 都要白等最多半秒才退出 —— 单实例无所谓，
+#: 但每个用例都起停一次（测试）就是几十秒。
+WAKE = -1
+
 
 class Pipeline:
     """接单 → 解析 → 下载 → 回话。"""
@@ -80,6 +86,10 @@ class Pipeline:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._running = False
+        # 先叫醒 worker：它们正卡在 queue.get(timeout=0.5) 上，
+        # 不叫的话每个都要白等半秒。
+        for _ in self._threads:
+            self._queue.put(WAKE)
         for order_id, flag in list(self._cancel_flags.items()):
             flag.set()
         for thread in self._threads:
@@ -103,6 +113,7 @@ class Pipeline:
             conversation_id=message.conversation_id,
             sender=message.sender,
             text=message.text,
+            meta=message.meta,
         )
         if not created:
             self.store.log(order.id, "重复消息，忽略")
@@ -116,10 +127,12 @@ class Pipeline:
 
     def submit_text(self, text: str, conversation_id: str = "manual",
                     channel: str = "console", sender: str = "",
-                    auto_reply: bool = True) -> tuple[Order, bool]:
+                    auto_reply: bool = True,
+                    meta: dict | None = None) -> tuple[Order, bool]:
         """便捷入口：直接给一段文本。"""
         message = IncomingMessage(
             channel=channel, conversation_id=conversation_id, text=text, sender=sender,
+            meta=dict(meta or {}),
         )
         return self.submit(message, auto_reply=auto_reply)
 
@@ -180,6 +193,11 @@ class Pipeline:
             except queue.Empty:
                 continue
             try:
+                if order_id == WAKE:
+                    # 收到停止信号。回到 while 判断，_running 已是 False 就退出。
+                    # 队列里可能还有真订单，但那是「进程正在关」的场景，
+                    # 订单状态已经落库，下次启动能重新捞。
+                    continue
                 self._process(order_id)
             except Exception as exc:  # noqa: BLE001 - worker 绝不能死
                 self.store.log(order_id, f"处理异常：{type(exc).__name__}: {exc}",

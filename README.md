@@ -114,14 +114,15 @@ start.bat doctor   :: 应该看到「ffmpeg 已启用  <路径>」
 
 ## 抖音 / 小红书下不了？需要配 Cookie
 
-抖音和小红书有**反爬风控**，yt-dlp 会报：
+抖音和小红书有**反爬风控**，偶发情况下 yt-dlp 会报：
 
 ```
 ERROR: [Douyin] xxxx: Fresh cookies (not necessarily logged in) are needed
 ```
 
-注意这不是「要你登录」，而是要你**带上浏览器 cookie**。B站、YouTube、微博、
-西瓜视频等不需要，抖音、小红书基本必须配。
+注意这**不是「要你登录」**——抖音/小红书大多时候不带 cookie 也能下；被风控时
+只要**带上游客 cookie**（浏览器访问一次抖音/小红书即可，不用登录账号）就能恢复。
+西瓜视频则是基本必须配 cookie。
 
 ### 配置步骤
 
@@ -211,16 +212,24 @@ start.bat platforms
 
 | 平台 | 结果 | 需 cookie |
 | --- | --- | --- |
-| 抖音 | ✅ 6.0 MB | 是 |
-| 小红书 | ✅ 2.4 MB（分享域名 `xhslink.cn` 也认） | 是 |
-| 哔哩哔哩 | ✅ 20.5 MB（完整链接 + `b23.tv` 短链都行） | 是 |
+| 抖音 | ✅ 走 **TikHub 第三方解析**（yt-dlp 已过时，`a_bogus` 签名解不了） | 否（要 TikHub API key） |
+| TikTok | ✅ 走 **TikHub 第三方解析**（同上） | 否（要 TikHub API key） |
+| 小红书 | ✅ 2.4 MB（分享域名 `xhslink.cn` 也认） | 带不带都行 |
+| 哔哩哔哩 | ✅ 20.5 MB（完整链接 + `b23.tv` 短链都行） | 带不带都行 |
 | YouTube | ✅ 232.5 MB | **否（千万别给它带 cookie）** |
+| 快手 | ⚠️ 自研 GraphQL 解析（快手反爬严，新鲜 `did` 会被滑块拦截） | 否 |
 | 直链 `.mp4` | ✅ 直接下载 | 否 |
 | 微博 | ⚠️ 解析器存在，但需登录态；实测样本链接已失效 | 是 |
 | 西瓜视频 | ⚠️ 解析器存在，但上游失效（`Failed to get SSR_HYDRATED_DATA`） | 是 |
-| TikTok / X / Instagram / Facebook / Vimeo / Twitch | ✅ yt-dlp 有解析器（未逐一实测） | 否 |
+| X / Instagram / Facebook / Vimeo / Twitch | ✅ yt-dlp 有解析器（未逐一实测） | 否 |
 | 腾讯视频 / 爱奇艺 / 优酷 / 芒果TV | ⛔ 按设计拦截（DRM） | — |
-| **快手 / 好看视频 / 皮皮虾 / 微信视频号** | ❌ **yt-dlp 没有解析器，无法自动化** | — |
+| **好看视频 / 皮皮虾 / 微信视频号** | ❌ **yt-dlp 没有解析器，无法自动化** | — |
+
+> **抖音 / TikTok 特别说明**：这两个平台现在是 **`a_bogus` 请求签名**风控，
+> yt-dlp 的解析器已过时（带 cookie 也没用，实测 403 `Uifid Not Found`）。
+> 唯一现实的路径是 **TikHub.io 第三方解析 API**（服务端维护签名算法）：
+> 注册 TikHub.io 拿 API key，填到 `config.json` 的 `delivery.tikhub.api_key`，
+> 下载抖音/TikTok 就会自动走 TikHub 拿无水印直链。免费档每日签到领额度。
 
 > **关于 cookie**：cookie 是**站点特定**的 —— 有的站点不带就下不了，
 > 有的站点带了反而会被风控拒绝。所以本项目按域名决定发不发
@@ -233,12 +242,13 @@ start.bat platforms
 
 | 平台 | 不带 cookie | 带 cookie | 结论 |
 | --- | --- | --- | --- |
-| **抖音** | ❌ `Fresh cookies are needed` | ✅ 成功 | **必须配 cookie** |
+| **抖音** | ❌ `a_bogus` 签名（yt-dlp 过时） | ❌ 一样被签名拦 | **走 TikHub API** |
 | 西瓜视频 | ❌ `Cookies are needed` | ✅ 解析通过 | 必须配（但解析器现在上游坏了） |
 | 小红书 | ✅ 成功 | ✅ 成功 | 带不带都行 |
 | 哔哩哔哩 | ✅ 成功 | ✅ 成功 | 带不带都行（带上可能拿到更高画质） |
 | **YouTube** | ✅ 成功 | ❌ `The page needs to be reloaded` | **千万不要带** |
 | TikTok / X / Instagram / Facebook | — | — | 同样不要带（cookie 与会话不匹配会被风控） |
+| 快手 | ⚠️ 自研 GraphQL（`did` 老化后可用） | — | 不走 cookie，走自研直链 |
 | 微博 | 未实测 | 未实测 | 没有有效样本链接 |
 
 所以：
@@ -488,10 +498,211 @@ class MyChannel(Channel):
 
 ---
 
+## 接闲鱼：下单 → 自动下载 → 发链接
+
+想真正做到「买家下单后自动接单、自动下载、自动交付」，需要一个能收发闲鱼消息的
+上游（比如 `xianyu-super-butler`），这个项目负责下载和交付。两者通过 HTTP 对接：
+
+```text
+买家付款  →  上游检测到「我已付款」            (xianyu-super-butler)
+          →  翻出买家之前发的链接，POST 本机 /api/orders
+          →  本机：识别 → 展开 → 下载                (本项目)
+          →  传到网盘拿分享链接
+          →  POST 上游 /api/xianyu/deliver
+          →  上游把「网盘链接 + 提取码」发给买家，并标记已发货
+```
+
+**为什么是发链接而不是发文件**：闲鱼聊天只支持文本和图片，发不了视频文件。
+所以「把视频交给买家」在现实中只能走「传到某处 → 发链接」。
+
+### 本项目这边要做的
+
+1. 授权网盘（目前实现了百度网盘）：
+
+   ```bat
+   start.bat baidu-login
+   ```
+
+   它会打印一个授权页地址。用你自己的百度账号登录并同意后，把页面上的 `code`
+   粘回来即可。凭据（`refresh_token`，有效期约 10 年）写进 `config.json`。
+
+   > 前提：先去 <https://pan.baidu.com/union> 建个应用拿到 `AppKey` / `SecretKey`，
+   > 并申请开通「上传」能力。这一步是人工的，代码替代不了。
+
+2. 单独验证交付通道（**强烈建议先跑这一步**）：
+
+   ```bat
+   start.bat upload "D:\某个视频.mp4"
+   ```
+
+3. 打开桥接渠道，`config.json` 里：
+
+   ```jsonc
+   {
+     "channels": { "xianyu_bridge": { "enabled": true } },
+     "delivery": {
+       "uploader": "baidu",
+       "mode": "share_link",
+       "bridge": {
+         "enabled": true,
+         "upstream_url": "http://127.0.0.1:8080",
+         "source_channels": ["xianyu"]
+       }
+     }
+   }
+   ```
+
+4. 探一下上游在不在：
+
+   ```bat
+   start.bat bridge-ping
+   ```
+
+### 上游那边要做的
+
+上游仓库不在这里，改动放在 `upstream_patch/`，含一个自包含的补丁模块和
+**精确到行**的插入说明，照做即可：
+
+```text
+upstream_patch/
+├── xianyu_video_bridge.py     ← 拷到上游根目录
+├── xianyu_video_bridge.json   ← 拷到上游根目录
+└── README.md                  ← 改哪两处、怎么验证、怎么回滚
+```
+
+两条设计底线：补丁只在「检测到付款」那个分支前面插一句判断，失败一律回退到
+上游原来的卡券发货；把 `xianyu_video_bridge.json` 里的 `enabled` 改成 `false`
+就完全失效，不用改代码。
+
+> ⚠️ 上游走的是逆向闲鱼协议的路线，本身有封号风险。这个风险由上游承担 ——
+> 本项目自身不含任何逆向对接代码，只负责下载和把文件变成链接。
+
+### 交付通道可替换
+
+`xydl/uploaders/` 是可插拔的。目前有：
+
+| 通道 | 说明 |
+| --- | --- |
+| `none` | 默认。只发文案不发链接（没配网盘时的安全降级） |
+| `s3` | **推荐**。对象存储预签名直链：腾讯云 COS / 阿里云 OSS / Cloudflare R2 / MinIO / 七牛 |
+| `baidu` | 百度网盘：分片上传可用，但**分享链接需要企业开发者认证 + 付费**，见下 |
+
+加新通道只要继承 `Uploader` 实现 `upload()`，
+在 `uploaders/__init__.py` 登记一行，业务代码不用动。
+
+#### 对象存储怎么配（推荐）
+
+一套 S3 兼容实现覆盖所有主流服务商，换服务商只改 `endpoint` + `region`：
+
+```jsonc
+"delivery": {
+  "uploader": "s3",
+  "s3": {
+    // 腾讯云 COS      https://cos.ap-guangzhou.myqcloud.com        ap-guangzhou
+    // 阿里云 OSS      https://s3.oss-cn-hangzhou.aliyuncs.com       oss-cn-hangzhou
+    // Cloudflare R2   https://<accountid>.r2.cloudflarestorage.com  auto
+    // MinIO（自建）    http://192.168.1.10:9000                     us-east-1
+    "endpoint": "",
+    "region": "",
+    "bucket": "",
+    "access_key_id": "",
+    "secret_access_key": "",
+    "prefix": "xianyu-video",
+    "path_style": false,        // MinIO / 私有实现常需 true
+    "url_expires_sec": 604800   // 预签名链接有效期，默认 7 天
+  }
+}
+```
+
+交付走**预签名直链**：链接自带有效期，过期自动失效，不用把桶设成公开。
+签名是纯标准库实现的 AWS SigV4（没有 boto3 依赖），并且用 AWS 官方文档公开的
+测试向量做已知答案校验 —— 签名算错时 S3 只会回一个 `SignatureDoesNotMatch`，
+不告诉你哪儿错了，所以这个校验不能省。
+
+若桶本身公开或挂了 CDN，填 `public_base_url` 就直接用永久直链、不做签名。
+
+> ⚠️ **桶请设成「私有读写」。** 公有读的桶有个很坑的地方：**它根本不校验签名**，
+> 于是预签名写错了也照样能下载 —— 你会以为一切正常，直到某天换了私有的桶
+> 才发现全军覆没。所以 `run.py upload` 会**主动探测**裸链接：返回 200 就警告你
+> 桶是公有的，返回 403 才确认保护真的生效。
+
+#### 百度网盘实测结论（2026-10）
+
+**上传 100% 可用；分享链接拿不到。**
+
+| 能力 | 实测结果 |
+| --- | --- |
+| OAuth 授权 | ✅ 通 |
+| 分片上传 `precreate`/`superfile2`/`create` | ✅ 通（实测 6MB 文件成功） |
+| 创建分享链接 `/rest/2.0/xpan/share?method=set` | ❌ 恒定 `errno=2` |
+| 创建分享链接 `/apaas/1.0/share/set`（新版） | ❌ `errno=13998 invalid app` |
+
+`errno=2` 在官方错误表里写作「参数错误」，但**参数完全正确时也会返回它**
+（`fid_list` / `fsid_list` / `file_id_list`、带不带 `pwd`、`period=0` 全试过）。
+新版接口直接说 `invalid app`。真实原因是：**这个应用没有开通「文件分享服务」** ——
+该服务是企业开发者专属的付费能力。
+
+所以百度网盘只能当「存储」用，交付分两步：
+
+1. `delivery.mode = "share_link"`（默认）：上传后自动生成链接。**资质没批之前会失败。**
+2. `delivery.mode = "upload_only"`：只上传，不碰分享接口。文件自动落到
+   `/apps/xianyu-video/`，运营去「我的分享」手动点一次分享。
+
+> 想让百度网盘全自动交付，得去开放平台申请企业开发者认证并购买文件分享服务。
+> 否则建议换交付通道 —— 对象存储（腾讯云 COS / 阿里云 OSS / Cloudflare R2）
+> 的预签名直链完全自己可控、成本极低，且不需要任何资质审批。
+
+---
+
+## 打包成桌面应用
+
+它也可以作为一个独立的「视频下载工具」卖 —— 不依赖闲鱼、不依赖上游，
+双击就是一个原生窗口。
+
+```bat
+.venv\Scripts\python.exe -m pip install pyinstaller
+.venv\Scripts\python.exe build_desktop.py
+```
+
+产物是 **`dist\视频下载工具.exe`（单个文件，约 118MB）**，双击即用，不依赖旁边任何目录。
+
+单文件的好处是拷贝/分发就是拷一个 exe，没有「哪个目录忘了带就起不来」的问题。
+用户第一次运行会在 exe 同级生成 `config.json` / `data` / `downloads` / `logs`。
+
+### 几个设计上的取舍
+
+| 决定 | 原因 |
+| --- | --- |
+| 桌面外壳走**浏览器应用模式**（`msedge --app=`），不用 pywebview | pywebview 内嵌 WebView2 初始化失败时会**递归重开自己** —— 实测一次启动炸出 50+ 进程，`ppid` 全指向第一个进程。卖出去的软件不能有这种失败模式 |
+| 给窗口一份独立 `user-data-dir`，放在 `%LOCALAPPDATA%` | 不与用户日常浏览器互相污染；也保证那个浏览器进程确实是我们自己的子进程，关窗能连带退出。放 exe 同级的话用户目录里会莫名多出一百多 MB 缓存，整个目录拷给别人时还连缓存一起带走 |
+| onefile（单文件） | 用户要「单独 exe 就能跑」。代价：每次启动要把内部约 170MB（含 ffmpeg）解到临时目录，冷启动比 onedir 慢几秒 |
+| `console=False` | 不要黑框。致命错误会弹 MessageBox，日志写到 `logs/desktop.log` |
+| 打包脚本收集 ffmpeg，**连带它依赖的 DLL，收进 exe 前真跑一次** | B站/YouTube/小红书 只给 DASH 分离流，没 ffmpeg 合不了流。对买家来说「下载失败」远比「请自己装 ffmpeg」友好。而**只收 `ffmpeg.exe` 是个陷阱**：conda 装的 ffmpeg 依赖同目录上百个 DLL，只收 exe 的话用户双击直接闪退（退出码 127，一行报错都没有）。所以打包脚本会顺着 PE 导入表把传递依赖全捞出来，onefile 启动时随包解到 `_MEIPASS/ffmpeg/` |
+| 窗口存活用**页面心跳**而不是 `proc.wait()` | Edge 的启动器进程和真正的浏览器进程不是同一个，`proc.wait()` 常常立刻返回 —— 照它走会出现「窗口刚开、服务就停了」 |
+| 端口被占时先探测是不是自己 | 是 → 复用那个实例再开个窗口（别起第二份程序抢同一个 SQLite）；不是 → 换空闲端口 |
+| 打包前把旧产物**改名挪走**而不是删除 | 上千个小文件的批量删除会被安全策略拦下导致打包失败；改名等价且不受影响 |
+
+启动排障：`logs/boot.log` 会记下每个阶段、进程号和父进程号；
+`logs/desktop.log` 是程序自身的输出。这两个文件出问题时比猜有用得多。
+
+### 打包后的路径规则（改代码时注意）
+
+`xydl/config.py` 把两个目录分开了，**不能混**：
+
+- `bundle_dir()` —— **只读资源**（`webui/index.html`）。打包后是 `sys._MEIPASS`，
+  onefile 模式下那是临时目录。
+- `app_dir()` —— **可写数据**（data / downloads / logs / config.json）。
+  打包后是 **exe 所在目录**。
+
+如果把可写数据放到 `_MEIPASS`，进程一退整个被删 —— 用户下好的视频会凭空消失。
+`tests/test_frozen_paths.py` 专门守这条。
+
+---
+
 ## 测试
 
 ```bat
-.venv\Scripts\python.exe -m pytest  :: 220 项，全部离线可跑（用本地 HTTP 服务器代替真实站点）
+.venv\Scripts\python.exe -m pytest  :: 384 项，全部离线可跑（用本地 HTTP 服务器代替真实站点）
 .venv\Scripts\python.exe -m pytest -k linkparse  :: 只跑链接识别
 start.bat selftest                    :: 端到端冒烟
 ```
@@ -506,6 +717,11 @@ start.bat selftest                    :: 端到端冒烟
 * `--no-part` 会让失败的半截文件不带 `.part` 后缀，从而被误认为成品
 * 分片文件绝不能当成下载产物（否则给客户发一个只有声音的文件）
 * ffmpeg 候选路径**必须实测能否运行**，失效的 shim 会让 yt-dlp 静默不合流
+* 打进包里的 ffmpeg **必须连依赖 DLL 一起拷，并拷完真跑一次** —— 只拷 exe 的话
+  在用户机器上是退出码 127 的静默闪退，而打包脚本会照样报「已带上 ffmpeg」
+* 冻结后 `sys.executable` 是**应用自己**，`subprocess.run([sys.executable, "-m", "yt_dlp"])`
+  等于「启动自己 -m yt_dlp」，会无限递归派生进程
+* 测试里的 `ThreadingTCPServer` 必须设 `block_on_close = False`，否则一个测试能白等十几秒
 * Windows 的 `SO_REUSEADDR` 允许绑定**已在监听**的端口，`allow_reuse_address=True`
   会让第二次启动「静默成功」——必须关掉，让端口冲突明确报错
 

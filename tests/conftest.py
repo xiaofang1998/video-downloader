@@ -36,7 +36,7 @@ class LocalServer:
         handler = functools.partial(_QuietHandler, directory=str(root))
         self._httpd = _QuietServer(("127.0.0.1", 0), handler)
         self.port = self._httpd.server_address[1]
-        self.thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, kwargs={'poll_interval': 0.05})
         self.thread.start()
 
     @property

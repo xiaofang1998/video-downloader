@@ -16,16 +16,19 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .base import Channel
-from ..config import ROOT, Config
+from ..config import ROOT, Config, bundle_dir
 from ..models import Order
 from ..utils import snippet
 
-INDEX_FILE = ROOT / "webui" / "index.html"
+#: 用 bundle_dir() 而不是 ROOT：打包成桌面应用后源码不在磁盘上，
+#: 页面是作为资源随包走的，得从 _MEIPASS 里找。
+INDEX_FILE = bundle_dir() / "webui" / "index.html"
 
 
 def open_in_file_manager(path: Path, select: bool = True) -> bool:
@@ -142,6 +145,12 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
 
+        # 记一下「最近一次有人来访问」。桌面应用靠它判断窗口是不是已经关了
+        # （页面每 2 秒轮询 /api/state，停了就说明窗口没了）。
+        channel = getattr(self.server, "channel", None)
+        if channel is not None:
+            channel.last_request_at = time.time()
+
         if path != "/" and not self._authorized(query):
             self._error(401, "缺少或错误的 token（在 config.json 的 server.token 里设置）")
             return
@@ -178,6 +187,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/reveal-dir" and method == "POST":
                 self._api_reveal_dir()
+                return
+            if path == "/api/cdp-login" and method == "POST":
+                self._api_cdp_login()
                 return
             self._error(404, f"没有这个路由：{path}")
         except ValueError as exc:
@@ -224,11 +236,18 @@ class _Handler(BaseHTTPRequestHandler):
         text = str(data.get("text") or "").strip()
         if not text:
             raise ValueError("text 不能为空（把买家发来的消息整段贴进来即可）")
+        # 上游桥接会把 channel 设成 xianyu、并带 meta（cookie_id 等）。
+        # 这两个字段是给渠道层用的：桥接渠道靠它们决定「这条要不要推回闲鱼」，
+        # 以及「推给哪个闲鱼账号」。人肉粘贴的订单不传，默认就是 console。
+        meta = data.get("meta")
+        if meta is not None and not isinstance(meta, dict):
+            raise ValueError("meta 必须是 JSON 对象")
         order, created = self.pipeline.submit_text(
             text=text,
             conversation_id=str(data.get("conversation_id") or "").strip() or "console",
-            channel="console",
+            channel=str(data.get("channel") or "console").strip() or "console",
             sender=str(data.get("sender") or "").strip(),
+            meta=meta or {},
         )
         self._json(200, {"ok": True, "created": created, "order": order.to_dict()})
 
@@ -304,6 +323,30 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "path": str(directory),
                          "opened": open_in_file_manager(directory)})
 
+    def _api_cdp_login(self) -> None:
+        """触发登录抖音/TikTok（登录态存进独立 profile，作为 TikHub 兜底）。"""
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except Exception:  # noqa: BLE001
+            body = {}
+        platform = str(body.get("platform") or "douyin").lower()
+        if platform not in ("douyin", "tiktok"):
+            self._error(400, "platform 只能是 douyin / tiktok")
+            return
+
+        def _run() -> None:
+            from xydl.cdp_fetch import login
+            login(platform,
+                  "https://www.douyin.com/" if platform == "douyin"
+                  else "https://www.tiktok.com/",
+                  wait_sec=180)
+
+        threading.Thread(target=_run, daemon=True).start()
+        self._json(200, {"ok": True,
+                         "message": f"已打开浏览器窗口，请在窗口里扫码登录 {platform}，"
+                                    "登录后关闭窗口即可"})
+
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
@@ -334,6 +377,9 @@ class ConsoleChannel(Channel):
         self._thread: threading.Thread | None = None
         #: 最近的回话，供控制台在没有轮询到 outbox 时兜底展示
         self.recent: list[dict] = []
+        #: 最近一次收到请求的时间戳。桌面应用用它判断窗口是否还开着
+        #: （页面每 2 秒轮询一次 /api/state）。0 表示还从没人访问过。
+        self.last_request_at: float = 0.0
         self._lock = threading.Lock()
 
     @property
@@ -362,9 +408,14 @@ class ConsoleChannel(Channel):
         server.pipeline = self.pipeline          # type: ignore[attr-defined]
         server.app_config = self.config          # type: ignore[attr-defined]
         server.channels_desc = self.label        # type: ignore[attr-defined]
+        server.channel = self                    # type: ignore[attr-defined]
         self._server = server
-        self._thread = threading.Thread(target=server.serve_forever,
-                                        name="xydl-console", daemon=True)
+        # poll_interval 默认 0.5s，意味着 shutdown() 最多要等半秒才返回。
+        # 服务本身是长驻的，但这半秒在「测试里每个用例都起一次服务」时就是几十秒。
+        self._thread = threading.Thread(
+            target=server.serve_forever, name="xydl-console", daemon=True,
+            kwargs={"poll_interval": 0.05},
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -375,6 +426,16 @@ class ConsoleChannel(Channel):
         if self._thread is not None:
             self._thread.join(timeout=3)
             self._thread = None
+
+    def set_channels_desc(self, text: str) -> None:
+        """由编排层塞进「当前启用了哪些渠道」的汇总。
+
+        渠道之间互相不认识，``channels_desc`` 原本被写死成本渠道自己的 label，
+        于是首页只显示「本地网页控制台」—— 开了桥接也看不见，很容易让人以为
+        桥接没生效。
+        """
+        if self._server is not None:
+            self._server.channels_desc = text  # type: ignore[attr-defined]
 
     def deliver(self, order: Order, text: str, file_path: str) -> None:
         with self._lock:

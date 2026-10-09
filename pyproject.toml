@@ -10,6 +10,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# 打包成桌面应用用。不需要 pywebview —— 桌面外壳走浏览器应用模式，
+# 内嵌 WebView 的 pywebview 在初始化失败时会递归重开自己，已弃用。
+desktop = ["pyinstaller>=6.0"]
 
 [tool.uv]
 # 不作为包安装：`uv run run.py` 直接以项目根目录为工作目录，import xydl 即可用
@@ -20,3 +23,9 @@ testpaths = ["tests"]
 addopts = "-q"
 # package = false 时项目不会被装进 site-packages，靠这个让 `import xydl` 找得到
 pythonpath = ["."]
+# 临时目录保留策略。pytest 默认把最近 3 次会话的 tmp 目录全留着，而这套测试
+# 每轮会写几十 MB、上千个小文件 —— Windows 上删这些小文件很慢。
+# 只留最近 1 轮：清理只发生在会话开始（一次），不会分摊到每个用例的 teardown 上
+# （`tmp_path_retention_policy = "failed"` 会在每个通过的用例后删目录，
+# 反而慢得多 —— 实测全套从 82s 涨到 194s）。
+tmp_path_retention_count = 1

@@ -86,7 +86,19 @@ def test_index_page_served(console):
     api, _, _ = console
     status, body = api.get("/")
     assert status == 200
-    assert "接单控制台" in body.decode("utf-8")
+    page = body.decode("utf-8")
+    assert "视频下载工具" in page
+
+
+def test_index_page_is_not_branded_for_xianyu(console):
+    """★ 页面是当「视频下载工具」卖的，不能再出现闲鱼/接单那套措辞。
+
+    这不会让程序崩，但买家一打开就看到「闲鱼接单控制台」—— 很尴尬。
+    """
+    api, _, _ = console
+    page = api.get("/")[1].decode("utf-8")
+    for word in ("接单控制台", "闲鱼", "买家", "复制回话"):
+        assert word not in page, f"页面上还残留着「{word}」"
 
 
 def test_state_endpoint_shape(console):
@@ -200,6 +212,56 @@ def test_unknown_route_returns_404(console):
     assert "没有这个路由" in json.loads(body)["error"]
 
 
+# ── 上游桥接：channel / meta ──────────────────────────────────────────
+def test_channel_and_meta_are_persisted(console, store):
+    """上游靠 channel 决定「推不推回闲鱼」、靠 meta 决定「推给哪个账号」，
+
+    所以这两个字段必须原样落库，不能只活在内存里。
+    """
+    api, _, _ = console
+    data = api.post_json("/api/orders", {
+        "text": "https://v.douyin.com/xxxx/",
+        "conversation_id": "chat_1",
+        "sender": "buyer_1",
+        "channel": "xianyu",
+        "meta": {"cookie_id": "acc1", "chat_id": "chat_1",
+                 "upstream_order_id": "9001", "item_id": "777"},
+    })
+    assert data["ok"]
+    assert data["order"]["channel"] == "xianyu"
+    assert data["order"]["meta"]["cookie_id"] == "acc1"
+
+    fresh = store.get(data["order"]["id"])
+    assert fresh.channel == "xianyu"
+    assert fresh.meta["upstream_order_id"] == "9001"
+    assert fresh.meta["item_id"] == "777"
+
+
+def test_default_channel_is_console(console):
+    """人肉粘贴的单默认走 console —— 桥接渠道据此把它排除在外。"""
+    api, _, _ = console
+    data = api.post_json("/api/orders", {"text": "在吗"})
+    assert data["order"]["channel"] == "console"
+    assert data["order"]["meta"] == {}
+
+
+def test_meta_must_be_object(console):
+    api, _, _ = console
+    status, body = api.post("/api/orders", {"text": "hi", "meta": "不是对象"})
+    assert status == 400
+    assert "meta" in json.loads(body)["error"]
+
+
+def test_legacy_client_without_channel_still_works(console, store, sample_server):
+    """老调用方（只传 text/conversation_id/sender）必须继续能用。"""
+    api, _, _ = console
+    data = api.post_json("/api/orders", {
+        "text": sample_server.url("sample.mp4"), "conversation_id": "old_client",
+    })
+    assert data["ok"] and data["created"]
+    assert wait_for_terminal(store, data["order"]["id"]).status == "done"
+
+
 # ── 打开文件夹 ────────────────────────────────────────────────────────
 def test_reveal_dir_opens_the_download_folder(console, monkeypatch):
     api, pipeline, _ = console
@@ -276,3 +338,25 @@ def test_token_protects_api(config: Config, store: Store):
     finally:
         channel.stop()
         pipeline.stop()
+
+
+def test_cdp_login_endpoint(console, monkeypatch):
+    """★ 登录抖音/TikTok 的界面入口（TikHub 兜底）。"""
+    import time
+    called = {}
+
+    def _fake_login(platform, url, wait_sec=0):
+        called["platform"] = platform
+
+    monkeypatch.setattr("xydl.cdp_fetch.login", _fake_login)
+    api, _, _ = console
+    data = api.post_json("/api/cdp-login", {"platform": "douyin"})
+    assert data["ok"] is True
+    time.sleep(0.6)  # 等后台线程跑起来
+    assert called.get("platform") == "douyin"
+
+
+def test_cdp_login_rejects_bad_platform(console):
+    api, _, _ = console
+    status, body = api.post("/api/cdp-login", {"platform": "bilibili"})
+    assert status == 400

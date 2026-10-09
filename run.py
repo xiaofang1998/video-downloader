@@ -8,7 +8,10 @@
     uv run run.py download <url>     # 只下载
     uv run run.py login douyin       # 登录抖音并配好 cookie（下不了抖音时用）
     uv run run.py cookies            # 查看浏览器里有没有目标站点的 cookie
-    uv run run.py doctor             # 环境自检（代理、引擎、搜索源、cookie）
+    uv run run.py baidu-login        # 授权百度网盘（交付用：发链接而不是发文件）
+    uv run run.py upload <文件>       # 传一个文件到网盘，打印分享链接
+    uv run run.py bridge-ping        # 检查上游「闲鱼超级管家」是否在线
+    uv run run.py doctor             # 环境自检（代理、引擎、搜索源、cookie、交付）
     uv run run.py selftest           # 离线自测（起本地 HTTP 服务验证全链路）
 
 注意：本机没有 `python` 命令，用 `uv run` 或 `.venv\\Scripts\\python.exe`。
@@ -81,6 +84,9 @@ def print_env_banner(pipeline: Pipeline, config: Config, channel_desc: str = "")
     print(f"  并发数     {pipeline.workers}")
     if channel_desc:
         print(f"  渠道       {channel_desc}")
+    from xydl.uploaders import build_uploader
+
+    print(f"  交付       {build_uploader(config).describe()}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -114,6 +120,14 @@ def cmd_serve(args) -> int:
         return 2
 
     print_env_banner(pipeline, config, manager.describe())
+
+    # 控制台首页会展示「当前启用了哪些渠道」。渠道之间互相不认识，得由这里
+    # 把汇总描述塞给它 —— 否则首页永远只显示「本地网页控制台」，
+    # 桥接明明开着也看不出来，很容易误判成没生效。
+    for channel in channels:
+        setter = getattr(channel, "set_channels_desc", None)
+        if callable(setter):
+            setter(manager.describe())
 
     if not pipeline.downloader.ytdlp.available:
         print("\n  ⚠ 没找到 yt-dlp —— 只能下载直链文件，B站/抖音/YouTube 这类")
@@ -408,7 +422,8 @@ def cmd_login(args) -> int:
 
     print(f"""
   ┌─────────────────────────────────────────────────────────────┐
-  │  1. 在刚打开的浏览器窗口里打开 {label}，需要登录就登录一次     │
+  │  1. 在刚打开的浏览器里**访问一次 {label}**（大多情况不用登录，  │
+  │     刷开页面、能正常播放就够了；只有西瓜/微博这类才可能要登录）  │
   │  2. 随便刷一两个视频，确认能正常播放                          │
   │  3. **完全关闭浏览器** —— 包括托盘/后台残留的进程             │
   │     （浏览器不关，cookie 数据库会被锁住，读不出来）           │
@@ -480,6 +495,25 @@ def _apply_cookie_config(args, ck, report) -> None:
     path = config.save()
     print(f"\n  ✓ 已写入 {path}")
     print(f'    "download": {{ "cookies_from_browser": "{spec}" }}')
+
+
+def cmd_cdp_login(args) -> int:
+    """CDP 登录抖音/TikTok：登录态存进独立 profile，作为 TikHub 额度用完时的兜底。"""
+    from xydl.cdp_fetch import login, login_profile_dir
+
+    platform = (args.site or "douyin").lower()
+    if platform not in ("douyin", "tiktok"):
+        print(f"不支持的站点 {platform!r}。可选：douyin / tiktok")
+        return 2
+    url = "https://www.douyin.com/" if platform == "douyin" else "https://www.tiktok.com/"
+    print(BANNER.format(version=__version__))
+    print(f"  目标站点   {platform}  {url}")
+    print(f"  登录态会存到 {login_profile_dir(platform)}（工具自管，与日常浏览器隔离）\n")
+    print("  会在弹出的 Edge 窗口里打开站点，请扫码登录，登录完成后关闭窗口。")
+    print("  （不关窗口也行，这里只等 90 秒）\n")
+    login(platform, url, wait_sec=90)
+    print(f"  ✓ 完成。之后下载 {platform} 时，TikHub 额度不够会自动切到这个登录态。")
+    return 0
 
 
 def cmd_cookies(args) -> int:
@@ -563,7 +597,7 @@ _EXTRACTOR_KEYS: dict[str, str] = {
 
 
 #: 实测**必须**带 cookie 才能解析的平台（关掉就会失败）
-MEASURED_REQUIRE_COOKIE: frozenset[str] = frozenset({"douyin", "xigua"})
+MEASURED_REQUIRE_COOKIE: frozenset[str] = frozenset({"xigua"})
 
 #: 实测**带了反而会坏**的平台（cookie 与会话不匹配会被风控拒绝）
 MEASURED_BREAK_WITH_COOKIE: frozenset[str] = frozenset(
@@ -571,7 +605,10 @@ MEASURED_BREAK_WITH_COOKIE: frozenset[str] = frozenset(
 )
 
 #: 实测**带不带都行**的平台
-MEASURED_EITHER_WAY: frozenset[str] = frozenset({"xiaohongshu", "bilibili"})
+MEASURED_EITHER_WAY: frozenset[str] = frozenset({"douyin", "xiaohongshu", "bilibili"})
+
+#: yt-dlp 没有解析器、由我们自研 GraphQL 兜底的平台
+SELF_RESOLVED: frozenset[str] = frozenset({"kuaishou"})
 
 
 def cmd_platforms(args) -> int:
@@ -600,7 +637,7 @@ def cmd_platforms(args) -> int:
     bad: list[str] = []
     for rule in linkparse.PLATFORMS:
         key = _EXTRACTOR_KEYS.get(rule.key, rule.key)
-        supported = any(key in n for n in names)
+        supported = any(key in n for n in names) or rule.key in SELF_RESOLVED
 
         if rule.drm:
             cookie = "-"
@@ -612,7 +649,10 @@ def cmd_platforms(args) -> int:
             bad.append(rule.label)
         else:
             ok.append(rule.label)
-            if rule.key in MEASURED_BREAK_WITH_COOKIE:
+            if rule.key in SELF_RESOLVED:
+                cookie = "不带"
+                mark, note = "✅", "自研 GraphQL 解析（快手反爬严，可能被滑块拦截）"
+            elif rule.key in MEASURED_BREAK_WITH_COOKIE:
                 cookie = "不带"
                 mark, note = "✅", "实测带了 cookie 反而被风控拒绝"
             elif rule.key in MEASURED_REQUIRE_COOKIE:
@@ -635,14 +675,193 @@ def cmd_platforms(args) -> int:
     print(f"  不可用 {len(bad)} 个：{'、'.join(bad)}")
     print()
     print("  关于 cookie（实测结论）：")
-    print("   · 抖音必须配 —— 不带 cookie 会报 Fresh cookies are needed")
+    print("   · 抖音 / 小红书 / 哔哩哔哩 带不带都行（抖音偶发风控时带游客 cookie 更稳）")
+    print("   · 西瓜视频必须配 —— 不带 cookie 会下不了")
     print("   · YouTube 千万不能带 —— 带了会被风控拒绝，反而下不了")
-    print("   · 小红书 / 哔哩哔哩 带不带都行（带上可能拿到更高画质）")
     print("   配法：start.bat login douyin")
     print()
     print("  升级 yt-dlp（解析器失效时用）：")
     print("     .venv\\Scripts\\python.exe -m pip install -U yt-dlp")
     return 0
+
+
+def cmd_baidu_login(args) -> int:
+    """走一遍百度网盘 OAuth 授权，把 refresh_token 写进配置。
+
+    为什么需要单独一条命令：百度网盘 API 是按「应用」授权的，跟你手机号无关。
+    你得先在开放平台建个应用拿到 AppKey/SecretKey，再用自己的账号点一次
+    「同意授权」，我们才能拿到长期凭据（refresh_token 有效期 10 年）。
+    """
+    from xydl.uploaders.baidu import BaiduPanUploader
+
+    config = Config.load(args.config).apply_env_overrides()
+    if args.app_key:
+        config.set("delivery.baidu.app_key", args.app_key.strip())
+    if args.secret_key:
+        config.set("delivery.baidu.secret_key", args.secret_key.strip())
+    uploader = BaiduPanUploader(config)
+
+    print(BANNER.format(version=__version__))
+    if not uploader.app_key or not uploader.secret_key:
+        print("  还缺应用的 AppKey / SecretKey。\n")
+        print("  1. 打开 https://pan.baidu.com/union ，用你的百度账号登录并完成实名认证")
+        print("  2. 在控制台创建一个应用，拿到 AppKey 与 SecretKey")
+        print("  3. 回来跑：")
+        print("       run.py baidu-login --app-key <AppKey> --secret-key <SecretKey>")
+        print(f"     （凭据会写到 {config.path}）")
+        return 2
+
+    url = uploader.authorize_url(qrcode=args.qrcode)
+    print("  1. 用浏览器打开下面这个地址（登录的是你自己的百度账号）：\n")
+    print(f"     {url}\n")
+    print("  2. 点「同意授权」。页面会显示一串 code（授权码）")
+    print("  3. 把 code 粘到下面按回车\n")
+    if args.open:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        code = input("  授权码 code： ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  已取消")
+        return 130
+    if not code:
+        print("  没拿到 code，已取消")
+        return 1
+
+    try:
+        payload = uploader.exchange_code(code)
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n  ❌ 换取 token 失败：{exc}")
+        return 1
+
+    config.set("delivery.baidu.refresh_token", payload.get("refresh_token", ""))
+    config.set("delivery.uploader", "baidu")
+    path = config.save()
+    print(f"\n  ✓ 授权成功，凭据已写入 {path}")
+    print(f"    refresh_token 有效期约 10 年，access_token 会自动续期")
+
+    try:
+        info = uploader.user_info()
+        print(f"\n  账号   {info.get('netdisk_name') or info.get('baidu_name')}")
+        print(f"  会员   {info.get('vip_type')}（0 普通 / 1 普通会员 / 2 超级会员）")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n  ⚠ 拿用户信息失败（不影响上传）：{exc}")
+
+    print("\n  下一步：")
+    print("    run.py upload <一个本地文件>    ← 实测上传 + 生成分享链接")
+    if config.get("delivery.baidu.share_api", "old") == "old":
+        print("    如果分享链接那一步失败，多半是应用没有分享权限：")
+        print("      · 新版分享服务需要企业开发者认证 + 购买分享服务")
+        print("      · 过渡方案：把 delivery.mode 设成 upload_only（只上传不发链接）")
+    return 0
+
+
+def cmd_upload(args) -> int:
+    """把本地文件传到网盘，打印可分享链接 —— 用来单独验证交付通道。"""
+    from pathlib import Path as _Path
+
+    from xydl.uploaders import build_uploader
+
+    config = Config.load(args.config).apply_env_overrides()
+    src = _Path(args.path)
+    if not src.is_file():
+        print(f"❌ 找不到文件：{src}")
+        return 1
+
+    uploader = build_uploader(config)
+    print(BANNER.format(version=__version__))
+    print(f"  上传通道   {uploader.describe()}")
+    print(f"  文件       {src}  ({human_size(src.stat().st_size)})")
+    print(f"  模式       {config.get('delivery.mode')}\n")
+    print("  正在上传…")
+
+    started = time.time()
+    result = uploader.upload(src, remote_name=args.name or "")
+    elapsed = time.time() - started
+
+    if not result.ok:
+        print(f"\n  ❌ 上传失败：{result.error}")
+        if "分享" in result.error:
+            print("\n  文件其实已经传上去了，只是没能生成分享链接。")
+            print("  可以把 delivery.mode 改成 upload_only 先跑通全流程。")
+        return 1
+
+    print(f"\n  ✅ 完成（{elapsed:.1f}s）")
+    print(f"  云端路径   {result.remote_path}")
+    print(f"  fs_id      {result.fs_id}")
+    print(f"  链接       {result.url}")
+    if result.pwd:
+        print(f"  提取码     {result.pwd}")
+    print("\n  发给买家的样子：")
+    for line in result.reply_line(str(config.get("delivery.link_template", "") or "")).splitlines():
+        print(f"    {line}")
+
+    # ── 顺手验一下这个链接真的能用、以及桶有没有敞着 ──────────────
+    # 交付的最后一环是「买家点开链接能下到东西」，这一步在本地就能验完，
+    # 别等真发出去才发现 403。
+    from xydl import http as http_util
+
+    print("\n  实测链接有效性…")
+    probe = http_util.request("GET", result.url, timeout=30, proxy="",
+                              max_bytes=16)
+    if probe.status == 200:
+        print("  ✓ 链接可下载（只取了前 16 字节，没整份拉下来）")
+    elif probe.status in (403, 401):
+        print(f"  ❌ 链接被拒：HTTP {probe.status}")
+        print(f"     {probe.text[:200]}")
+        print("     常见原因：桶是私有的但签名/时钟不对；或对象 ACL 覆盖了签名")
+        return 1
+    else:
+        print(f"  ⚠ 链接返回 HTTP {probe.status}：{probe.text[:160]}")
+
+    if "X-Amz-Signature=" in result.url:
+        bare = result.url.split("?")[0]
+        unsigned = http_util.request("GET", bare, timeout=15, proxy="",
+                                     max_bytes=16)
+        if unsigned.status == 200:
+            print("\n  ⚠⚠ 这个桶是「公有读」的 —— 不带签名的裸链接也能下载。")
+            print("      意思是预签名那层保护形同虚设，任何人猜到路径就能拿文件，")
+            print("      而且公开桶容易被当外链滥用（违反服务商条款、可能被限流）。")
+            print("      改成私有读写即可：")
+            print("        COS 控制台 → 存储桶 → 权限管理 → 访问权限 → 私有读写")
+            print("        OSS 控制台 → Bucket → 读写权限 → 私有")
+            print("      改完预签名链接照常可用，裸链接会变成 403。")
+        elif unsigned.status in (403, 401):
+            print("\n  ✓ 桶是私有的，裸链接被拒（403）—— 预签名保护正常生效")
+    return 0
+
+
+def cmd_bridge_ping(args) -> int:
+    """探一下上游「闲鱼超级管家」在不在。"""
+    from xydl.channels.xianyu_bridge import XianyuBridgeChannel
+
+    config = Config.load(args.config).apply_env_overrides()
+    config.ensure_dirs()
+    store = Store(config.path_of("data_dir") / "xydl.sqlite3")
+    pipeline = Pipeline(config, store)
+    channel = XianyuBridgeChannel(pipeline, config)
+
+    print(BANNER.format(version=__version__))
+    print(f"  上游地址   {channel.upstream}{channel.deliver_path}")
+    print(f"  回传来源   {'、'.join(sorted(channel.source_channels))}")
+    print(f"  上传通道   {channel.uploader.describe()}")
+    print(f"  交付模式   {channel.mode}\n")
+
+    ok, message = channel.ping()
+    store.close()
+    if ok:
+        print(f"  ✓ {message}")
+        print("\n  上游在线。记得在 config.json 里打开 channels.xianyu_bridge.enabled")
+        return 0
+    print(f"  ✗ {message}")
+    print("\n  常见原因：")
+    print("   · 上游还没启动（python Start.py，默认 8080 端口）")
+    print("   · 端口/地址不对 → 改 delivery.bridge.upstream_url")
+    print("   · 上游装在另一台机器 → 填对局域网 IP，并确认防火墙放行")
+    return 1
 
 
 def cmd_doctor(args) -> int:
@@ -733,12 +952,42 @@ def cmd_doctor(args) -> int:
         print(f"  {key:<14} {path}")
 
     print("\n[渠道]")
-    for name in ("console", "inbox"):
+    for name in ("console", "inbox", "xianyu_bridge"):
         enabled = config.get(f"channels.{name}.enabled", False)
         extra = ""
         if name == "console":
             extra = f"  http://{config.get('server.host')}:{config.get('server.port')}"
+        elif name == "xianyu_bridge":
+            extra = f"  → {config.get('delivery.bridge.upstream_url')}"
         print(f"  {'✓' if enabled else '✗'} {name}{extra if enabled else ''}")
+
+    # 交付通道：闲鱼发不了视频文件，这一步决定了「怎么把视频交给买家」
+    print("\n[交付（网盘 / 对象存储）]")
+    from xydl.uploaders import build_uploader
+
+    uploader = build_uploader(config)
+    name = str(config.get("delivery.uploader", "none"))
+    print(f"  上传通道   {uploader.describe()}")
+    print(f"  交付模式   {config.get('delivery.mode')}")
+    if name == "baidu":
+        token_path = config.path_of("data_dir") / "baidu_token.json"
+        has_refresh = bool(str(config.get("delivery.baidu.refresh_token", "") or "").strip())
+        if token_path.exists():
+            print(f"  access_token  {token_path}  ✓ 已有缓存")
+        print(f"  授权状态   {'✓ refresh_token 已配置' if has_refresh else '✗ 未授权 → run.py baidu-login'}")
+        print(f"  分享接口   {config.get('delivery.baidu.share_api')}"
+              "（新版分享需企业认证+付费，失败可改 delivery.mode=upload_only）")
+    elif name == "s3":
+        missing = [k for k in ("endpoint", "bucket", "access_key_id", "secret_access_key")
+                   if not str(config.get(f"delivery.s3.{k}", "") or "").strip()]
+        if missing:
+            print(f"  ✗ 还缺配置：delivery.s3.{' / delivery.s3.'.join(missing)}")
+        else:
+            print("  ✓ 配置齐全（跑 run.py upload <文件> 实测一次）")
+        print(f"  链接有效期 {int(config.get('delivery.s3.url_expires_sec', 604800)) // 86400} 天"
+              f"（预签名直链，过期自动失效）")
+    else:
+        print("  ✗ 没配上传通道 —— 交付只会发文案，不会带链接")
 
     # 数据库能不能打开
     print("\n[数据库]")
@@ -956,12 +1205,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--test", help="配好后立刻用这条链接验证能不能解析")
     p.set_defaults(func=cmd_login)
 
+    p = sub.add_parser("cdp-login", help="CDP 登录抖音/TikTok（登录态兜底，TikHub 额度不够时用）")
+    p.add_argument("site", nargs="?", default="douyin", help="douyin / tiktok")
+    p.set_defaults(func=cmd_cdp_login)
+
     p = sub.add_parser("cookies", help="查看各浏览器里有没有目标站点的 cookie")
     p.add_argument("site", nargs="?", help="只查某一个站点")
     p.set_defaults(func=cmd_cookies)
 
     p = sub.add_parser("platforms", help="列出各平台支持情况（接单前先查）")
     p.set_defaults(func=cmd_platforms)
+
+    p = sub.add_parser("baidu-login", help="授权百度网盘（写入 refresh_token）")
+    p.add_argument("--app-key", help="开放平台应用的 AppKey")
+    p.add_argument("--secret-key", help="开放平台应用的 SecretKey")
+    p.add_argument("--qrcode", action="store_true", help="生成扫码授权页而不是普通授权页")
+    p.add_argument("--open", action="store_true", help="顺便用默认浏览器打开授权页")
+    p.set_defaults(func=cmd_baidu_login)
+
+    p = sub.add_parser("upload", help="把本地文件传上网盘，打印分享链接")
+    p.add_argument("path", help="要上传的文件")
+    p.add_argument("-n", "--name", default="", help="云端文件名（默认沿用原名）")
+    p.set_defaults(func=cmd_upload)
+
+    p = sub.add_parser("bridge-ping", help="检查上游「闲鱼超级管家」是否在线")
+    p.set_defaults(func=cmd_bridge_ping)
 
     p = sub.add_parser("selftest", help="离线自测")
     p.set_defaults(func=cmd_selftest)

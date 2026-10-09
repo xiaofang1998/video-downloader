@@ -22,11 +22,13 @@ from __future__ import annotations
 from .base import Channel, ChannelManager
 from .console import ConsoleChannel, PortInUseError
 from .inbox import InboxChannel
+from .xianyu_bridge import XianyuBridgeChannel
 
 #: 名字 → 渠道类。加新渠道只要在这里登记一行。
 CHANNEL_CLASSES: dict[str, type[Channel]] = {
     ConsoleChannel.name: ConsoleChannel,
     InboxChannel.name: InboxChannel,
+    XianyuBridgeChannel.name: XianyuBridgeChannel,
 }
 
 __all__ = [
@@ -34,6 +36,7 @@ __all__ = [
     "ChannelManager",
     "ConsoleChannel",
     "InboxChannel",
+    "XianyuBridgeChannel",
     "PortInUseError",
     "CHANNEL_CLASSES",
     "build_channels",

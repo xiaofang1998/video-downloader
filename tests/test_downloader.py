@@ -649,3 +649,245 @@ def test_ensure_unique(tmp_path: Path):
     (tmp_path / "a-1.mp4").write_bytes(b"2")
     assert ensure_unique(target).name == "a-2.mp4"
     assert ensure_unique(tmp_path / "new.mp4").name == "new.mp4"
+
+
+def test_download_clears_stale_files_before_running(config: Config, tmp_path: Path,
+                                                    monkeypatch):
+    """★ 回归：任务目录里上次残留的成品，不能被误判成本次下载结果。
+
+    真踩过：``run.py download`` 复用同一个 job_dir，抖音下载失败（缺 cookie）
+    时，``_locate_output`` 的「取最大文件」兜底把上一次 YouTube 留下的
+    Bow.mp4 当成这次的成功 —— 文件名、大小全是上个任务的，还报「✅ 成功」。
+    """
+    from xydl.downloader import DownloadResult
+
+    job = tmp_path / "job"
+    job.mkdir()
+    stale = job / "old.mp4"
+    stale.write_bytes(b"x" * 100)
+
+    dl = Downloader(config)
+
+    def _fail(*_a, **_k):
+        return DownloadResult(False, engine="", error="下载失败")
+
+    monkeypatch.setattr(dl.ytdlp, "download", _fail)
+    monkeypatch.setattr(dl.http, "download", _fail)
+
+    result = dl.download("http://example.com/v", job)
+
+    assert result.ok is False, "失败不能误报成功"
+    assert not stale.exists(), "开跑前必须清掉上次残留，否则会被误判成本次产物"
+
+
+def test_is_kuaishou():
+    from xydl.downloader import is_kuaishou
+
+    assert is_kuaishou("https://www.kuaishou.com/short-video/3xabc")
+    assert is_kuaishou("https://v.kuaishou.com/abc123")
+    assert is_kuaishou("https://www.kwai.com/video/522066")
+    assert not is_kuaishou("https://www.douyin.com/video/123")
+    assert not is_kuaishou("https://www.bilibili.com/video/BV123")
+
+
+def test_kuaishou_photo_url_full_flow(monkeypatch):
+    """mock 网络，验证短链展开 → photoId → GraphQL → photoUrl 的完整链路。"""
+    import json as _json
+    from xydl.downloader import kuaishou_photo_url
+
+    # 1) 短链展开：项目 http.request 返回最终 URL
+    class _Resp:
+        url = "https://www.kuaishou.com/short-video/3xk8abc"
+
+    monkeypatch.setattr("xydl.http.request", lambda *a, **k: _Resp())
+
+    # 2) did cookie + GraphQL：mock 标准库 urllib opener
+    class _Cookie:
+        name = "did"
+        value = "web_test"
+
+    class _CJ:
+        def __iter__(self):
+            return iter([_Cookie()])
+
+    class _Resp2:
+        def read(self):
+            return _json.dumps({
+                "data": {"visionVideoDetail": {
+                    "photo": {"photoUrl": "https://cdn/xxx.mp4", "caption": "标题"}
+                }}
+            }).encode()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp2()
+
+    monkeypatch.setattr("http.cookiejar.CookieJar", lambda: _CJ())
+    monkeypatch.setattr("urllib.request.build_opener", lambda *a: _Opener())
+
+    url, caption = kuaishou_photo_url("https://v.kuaishou.com/abc")
+    assert url == "https://cdn/xxx.mp4"
+    assert caption == "标题"
+
+
+def test_kuaishou_photo_url_returns_empty_on_captcha(monkeypatch):
+    """GraphQL 返回滑块拦截（无 photoUrl）时应返回空串，不抛异常。"""
+    import json as _json
+    from xydl.downloader import kuaishou_photo_url
+
+    class _Resp:
+        url = "https://www.kuaishou.com/short-video/3xk8abc"
+    monkeypatch.setattr("xydl.http.request", lambda *a, **k: _Resp())
+
+    class _Cookie:
+        name = "did"
+        value = "web_test"
+    class _CJ:
+        def __iter__(self):
+            return iter([_Cookie()])
+    class _Resp2:
+        def read(self):
+            return _json.dumps({"data": {"result": 400002}}).encode()
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp2()
+    monkeypatch.setattr("http.cookiejar.CookieJar", lambda: _CJ())
+    monkeypatch.setattr("urllib.request.build_opener", lambda *a: _Opener())
+
+    url, caption = kuaishou_photo_url("https://v.kuaishou.com/abc")
+    assert url == ""
+    assert caption == ""
+
+
+def test_needs_cookie():
+    from xydl.downloader import _needs_cookie
+
+    assert _needs_cookie("该站点风控要求带 cookie")
+    assert _needs_cookie("Fresh cookies are needed")
+    assert not _needs_cookie("直链：这个链接返回的是网页")
+    assert not _needs_cookie("")
+
+
+def test_download_retries_with_browser_cookies(config: Config, tmp_path: Path,
+                                               monkeypatch):
+    """★ 回归：下载报「需要 cookie」且没配 cookie 时，静默读浏览器 cookie 重试。"""
+    from xydl.downloader import DownloadResult
+
+    job = tmp_path / "job"
+    job.mkdir()
+    dl = Downloader(config)
+
+    calls: list[bool] = []
+
+    def _dl(url, job_dir, *, title_hint="", progress=None, cancel=None):
+        calls.append(1)
+        # 第一次（没 cookie）失败，第二次（带 cookie）成功
+        if len(calls) == 1:
+            return DownloadResult(False, engine="ytdlp", error="该站点风控要求带 cookie")
+        return DownloadResult(True, engine="ytdlp", file_path=str(job / "ok.mp4"),
+                              title="ok", size_bytes=100)
+
+    monkeypatch.setattr(dl.ytdlp, "download", _dl)
+    monkeypatch.setattr(dl.ytdlp, "detect_browsers", lambda: ["edge"])
+    # 测试 fixture 默认关掉 yt-dlp（走直链），这里强制开
+    monkeypatch.setattr(dl, "prefer_ytdlp", True)
+    monkeypatch.setattr(type(dl.ytdlp), "available", property(lambda self: True))
+    monkeypatch.setattr(dl.http, "download",
+                        lambda *a, **k: DownloadResult(False, engine="http", error="x"))
+
+    result = dl.download("https://www.douyin.com/video/123", job)
+    assert result.ok is True, "读浏览器 cookie 重试后应该成功"
+    assert len(calls) == 2, "应该重试了一次"
+
+
+def test_download_falls_back_to_cdp_for_douyin(config: Config, tmp_path: Path,
+                                               monkeypatch):
+    """★ 抖音：读浏览器 cookie 也失败时，降级到 CDP 拿明文 cookie 重试。"""
+    from xydl.downloader import DownloadResult
+
+    job = tmp_path / "job"
+    job.mkdir()
+    dl = Downloader(config)
+
+    calls: list[int] = []
+
+    def _dl(url, job_dir, *, title_hint="", progress=None, cancel=None):
+        calls.append(1)
+        if len(calls) == 1:
+            return DownloadResult(False, engine="ytdlp", error="该站点风控要求带 cookie")
+        return DownloadResult(True, engine="ytdlp", file_path=str(job / "ok.mp4"),
+                              title="ok", size_bytes=100)
+
+    monkeypatch.setattr(dl, "prefer_ytdlp", True)
+    monkeypatch.setattr(type(dl.ytdlp), "available", property(lambda self: True))
+    monkeypatch.setattr(dl.ytdlp, "download", _dl)
+    # 浏览器里没有 cookie 可读
+    monkeypatch.setattr(dl.ytdlp, "detect_browsers", lambda: [])
+    # CDP 拿到明文 cookie
+    monkeypatch.setattr("xydl.cdp_cookies.douyin_guest_cookies",
+                        lambda url: {"s_v_web_id": "x", "ttwid": "y", "UIFID": "z"})
+    monkeypatch.setattr(dl.http, "download",
+                        lambda *a, **k: DownloadResult(False, engine="http", error="x"))
+
+    result = dl.download("https://www.douyin.com/video/123", job)
+    assert result.ok is True, "CDP 拿 cookie 重试后应该成功"
+    assert len(calls) == 2, "应该先失败一次、CDP 重试一次"
+
+
+def test_non_douyin_does_not_use_cdp(config: Config, tmp_path: Path, monkeypatch):
+    """非抖音站点缺 cookie 时，不该去启动 Edge CDP。"""
+    from xydl.downloader import DownloadResult
+
+    job = tmp_path / "job"
+    job.mkdir()
+    dl = Downloader(config)
+
+    monkeypatch.setattr(dl, "prefer_ytdlp", True)
+    monkeypatch.setattr(type(dl.ytdlp), "available", property(lambda self: True))
+    monkeypatch.setattr(dl.ytdlp, "download",
+                        lambda *a, **k: DownloadResult(False, engine="ytdlp", error="该站点风控要求带 cookie"))
+    monkeypatch.setattr(dl.ytdlp, "detect_browsers", lambda: [])
+    called = []
+    monkeypatch.setattr("xydl.cdp_cookies.douyin_guest_cookies", lambda url: called.append(1) or {})
+    monkeypatch.setattr(dl.http, "download",
+                        lambda *a, **k: DownloadResult(False, engine="http", error="x"))
+
+    result = dl.download("https://www.xiaohongshu.com/explore/123", job)
+    assert result.ok is False
+    assert not called, "小红书不该触发抖音 CDP"
+
+
+def test_douyin_falls_back_to_cdp_when_tikhub_fails(config: Config, tmp_path: Path,
+                                                     monkeypatch):
+    """★ 抖音：TikHub 失败时，降级到登录态 CDP 本地解析。"""
+    from xydl.downloader import DownloadResult
+
+    job = tmp_path / "job"
+    job.mkdir()
+    dl = Downloader(config)
+
+    monkeypatch.setattr(dl, "prefer_ytdlp", True)
+    monkeypatch.setattr(type(dl.ytdlp), "available", property(lambda self: True))
+    # yt-dlp 失败
+    monkeypatch.setattr(dl.ytdlp, "download",
+                        lambda *a, **k: DownloadResult(False, engine="ytdlp", error="x"))
+    # TikHub 失败（额度用完）
+    monkeypatch.setattr("xydl.tikhub.resolve",
+                        lambda url, key: ("", "额度用完"))
+    # CDP 兜底成功
+    monkeypatch.setattr("xydl.cdp_fetch.fetch_douyin_video",
+                        lambda url, profile: ("https://cdn/dy.mp4", "测试视频"))
+    monkeypatch.setattr("xydl.cdp_fetch.login_profile_dir",
+                        lambda platform: tmp_path / "browser-login" / platform)
+    (tmp_path / "browser-login" / "douyin").mkdir(parents=True)
+    downloaded = {}
+    monkeypatch.setattr(dl.http, "download",
+                        lambda url, job_dir, **k: (
+                            downloaded.update(url=url) or
+                            DownloadResult(True, engine="http",
+                                           file_path=str(job / "ok.mp4"),
+                                           title=k.get("title_hint", ""), size_bytes=100)))
+
+    result = dl.download("https://www.douyin.com/video/123", job)
+    assert result.ok is True
+    assert downloaded.get("url") == "https://cdn/dy.mp4"

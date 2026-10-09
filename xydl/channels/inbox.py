@@ -135,11 +135,12 @@ class InboxChannel(Channel):
             if not text:
                 raise ValueError("缺少 text 字段")
             return IncomingMessage(
-                channel="inbox",
+                channel=str(data.get("channel") or "inbox"),
                 conversation_id=str(data.get("conversation_id") or "inbox"),
                 text=text,
                 sender=str(data.get("sender") or ""),
                 msg_id=str(data.get("msg_id") or path.stem),
+                meta=dict(data.get("meta") or {}) if isinstance(data.get("meta"), dict) else {},
             )
 
         meta: dict[str, str] = {}

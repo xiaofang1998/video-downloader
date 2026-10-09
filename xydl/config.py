@@ -8,11 +8,39 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-#: 项目根目录（本文件在 <root>/xydl/config.py）
+#: 开发时的项目根目录（本文件在 <root>/xydl/config.py）。
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def is_frozen() -> bool:
+    """是否跑在 PyInstaller 打出来的包里。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def bundle_dir() -> Path:
+    """**只读资源**（webui/、内置模板等）所在目录。
+
+    PyInstaller 会把随包资源解到 ``sys._MEIPASS``（onefile 是临时目录，
+    onedir 就是 exe 旁边）。开发时就是项目根目录。
+    """
+    if is_frozen():
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return ROOT
+
+
+def app_dir() -> Path:
+    """**可写数据**（data / downloads / inbox / logs / config.json）的基准目录。
+
+    打包后必须落在 **exe 旁边**，绝不能放 ``_MEIPASS`` —— onefile 模式下那是
+    临时目录，进程一退整个被删掉，用户下好的视频会凭空消失。
+    """
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return ROOT
 
 DEFAULTS: dict[str, Any] = {
     "server": {
@@ -54,7 +82,8 @@ DEFAULTS: dict[str, Any] = {
         # 传给 yt-dlp 的额外参数，按需自行追加
         "ytdlp_extra_args": [],
         # 例如 "chrome" / "edge"，从浏览器读 cookie；留空则不用。
-        # 抖音/小红书这类有风控的站点基本必须配这个（或下面的 cookies_file）。
+        # 抖音/小红书这类有风控的站点，配了游客 cookie（浏览器访问一次即可，
+        # 无需登录）下得更稳；西瓜视频则是基本必须配。
         "cookies_from_browser": "",
         # Netscape 格式的 cookies.txt 路径。适合本机没装浏览器、
         # 或想用另一台机器导出的 cookie 的情况。与 cookies_from_browser 二选一。
@@ -63,7 +92,7 @@ DEFAULTS: dict[str, Any] = {
         # B站 / YouTube / 小红书这类只有 DASH 分离流的站点，没有 ffmpeg 就下不了。
         "ffmpeg_location": "",
         # ── cookie 下发策略 ────────────────────────────────────────
-        # cookie 是**站点特定**的：抖音/西瓜不带 cookie 就下不了，
+        # cookie 是**站点特定**的：西瓜不带 cookie 就下不了，
         # 而 YouTube 带了别的会话的 cookie 反而会被风控拒绝
         # （"The page needs to be reloaded"）。所以按域名决定发不发。
         #   auto  = 只在下面 cookie_domains 里匹配到的站点带（推荐）
@@ -152,6 +181,89 @@ DEFAULTS: dict[str, Any] = {
     "channels": {
         "console": {"enabled": True},
         "inbox": {"enabled": False, "poll_sec": 2.0},
+        # 闲鱼桥接：和上游「闲鱼超级管家」对接时打开
+        "xianyu_bridge": {"enabled": False},
+    },
+    # ── 交付：把下载好的文件变成一条能发给买家的链接 ────────────────
+    # 为什么必须有这一段：闲鱼聊天只支持文本和图片，发不了视频文件。
+    # 所以「把视频交给买家」只能是「传到某处 → 发链接」。
+    "delivery": {
+        # 上传通道：none / baidu / s3
+        "uploader": "none",
+        # share_link = 上传后生成分享链接一起发出去
+        # upload_only = 只上传不发链接（分享权限还没批下来时的过渡）
+        "mode": "share_link",
+        # 发给买家的链接文案，{url} 是链接、{pwd} 是提取码。
+        # 留空则用内置句式（下面 uploader.base 里的默认）。
+        "link_template": "",
+        # 下载中要不要给买家推进度（默认不推，免得刷屏）
+        "forward_progress": False,
+        # 上传失败时追加在话术后面的一句提示；留空则不追加
+        "upload_fail_note": "（网盘链接稍后补发，稍等一下下～）",
+        # upload_only 模式下追加的提示。注意此时**不是**失败：
+        # 文件已经在网盘里了，只是没生成分享链接。
+        "upload_only_note": "",
+
+        # ── TikHub 第三方解析（抖音/TikTok 无水印）────────────────
+        # 抖音/TikTok 的 a_bogus 签名本地逆向不现实，TikHub.io 在服务端维护了
+        # 签名算法。填上 API key（免费注册 + 每日签到领额度）后，下载抖音/TikTok
+        # 会自动走 TikHub 拿无水印直链。
+        "tikhub": {
+            "api_key": "",
+        },
+
+        # ── 百度网盘 ────────────────────────────────────────────────
+        "baidu": {
+            "app_key": "",            # 开放平台应用的 AppKey
+            "secret_key": "",         # 应用的 SecretKey
+            "refresh_token": "",      # 跑 `run.py baidu-login` 自动写入
+            "remote_dir": "/apps/xianyu-video",
+            "share_period_days": 7,   # 分享有效期（天），0 = 永久
+            "share_pwd": "",          # 固定提取码；留空则每次随机 4 位
+            "share_api": "old",       # old / new / auto —— 见 uploaders/baidu.py 的说明
+            "upload_host": "",        # 留空自动从候选域名里试
+            "slice_mb": 4,            # 普通用户固定 4MB，会员可调大
+        },
+
+        # ── 对象存储（S3 兼容：COS / OSS / R2 / MinIO / 七牛）────────
+        # 交付走预签名直链：链接带有效期，过期自动失效，不用把桶设成公开。
+        # 换服务商只改 endpoint + region。
+        "s3": {
+            # 腾讯云 COS  https://cos.ap-guangzhou.myqcloud.com      ap-guangzhou
+            # 阿里云 OSS  https://s3.oss-cn-hangzhou.aliyuncs.com     oss-cn-hangzhou
+            # Cloudflare R2  https://<accountid>.r2.cloudflarestorage.com   auto
+            # MinIO（自建） http://192.168.1.10:9000                 us-east-1
+            "endpoint": "",
+            "region": "",
+            "bucket": "",
+            "access_key_id": "",
+            "secret_access_key": "",
+            "session_token": "",      # 用临时凭据（STS）时才需要
+            # 上传到桶里的哪个前缀（相当于目录）
+            "prefix": "xianyu-video",
+            # MinIO / 私有实现常不支持 virtual-host 风格，填 true 走路径风格
+            "path_style": False,
+            # 预签名链接有效期（秒）。默认 7 天
+            "url_expires_sec": 604800,
+            # 桶公开或挂了 CDN 时填这里，直接用永久直链、不做签名
+            "public_base_url": "",
+            # 可选：对象的 ACL，例如 "public-read"。留空则由桶策略决定
+            "acl": "",
+        },
+
+        # ── 上游桥接 ────────────────────────────────────────────────
+        "bridge": {
+            "enabled": True,
+            "upstream_url": "http://127.0.0.1:8080",
+            "deliver_path": "/api/xianyu/deliver",
+            # 与上游约定的共享密钥，会放进 X-Auth-Token 头。留空则不校验。
+            "token": "",
+            # 只回传这些来源渠道的订单。上游把 channel 设成 xianyu；
+            # 人肉粘贴的 console 单默认不会被推回闲鱼（避免测试单发给真买家）。
+            "source_channels": ["xianyu"],
+            "timeout_sec": 15,
+            "retries": 2,
+        },
     },
     "logging": {"level": "INFO", "keep_days": 14},
 }
@@ -188,7 +300,7 @@ class Config:
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
         """从 config.json 读；文件不存在就写一份默认配置出去。"""
-        cfg_path = Path(path) if path else ROOT / "config.json"
+        cfg_path = Path(path) if path else app_dir() / "config.json"
         data: dict[str, Any] = {}
         if cfg_path.exists():
             with open(cfg_path, "r", encoding="utf-8") as fh:
@@ -228,11 +340,11 @@ class Config:
 
     # ── 路径辅助 ───────────────────────────────────────────────────
     def path_of(self, key: str) -> Path:
-        """把 paths.<key> 解析成绝对路径（相对路径基于项目根目录）。"""
+        """把 paths.<key> 解析成绝对路径（相对路径基于可写目录）。"""
         raw = self.get(f"paths.{key}", key)
         p = Path(str(raw))
         if not p.is_absolute():
-            p = ROOT / p
+            p = app_dir() / p
         return p
 
     def ensure_dirs(self) -> dict[str, Path]:

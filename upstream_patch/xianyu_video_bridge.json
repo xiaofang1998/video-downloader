@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "local_url": "http://127.0.0.1:8765",
+  "local_token": "",
+  "item_ids": [],
+  "link_lookback": 30,
+  "buyer_roles": ["user"],
+  "auth_token": "",
+  "mark_shipped": true
+}

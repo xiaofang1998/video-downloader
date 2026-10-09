@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS orders (
     file_size       INTEGER NOT NULL DEFAULT 0,
     reply           TEXT NOT NULL DEFAULT '',
     error           TEXT NOT NULL DEFAULT '',
+    meta            TEXT NOT NULL DEFAULT '{}',
     replied_at      REAL,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
@@ -65,7 +66,13 @@ CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(delivered, id);
 _COLUMNS = (
     "external_id", "channel", "conversation_id", "sender", "text", "status",
     "stage", "progress", "links", "chosen_url", "title", "file_path",
-    "file_size", "reply", "error", "created_at", "updated_at",
+    "file_size", "reply", "error", "meta", "created_at", "updated_at",
+)
+
+#: 新加的列必须登记在这里，否则读老库会漏字段。
+#: 形如 (列名, 建表时该列的 DDL 片段)。
+_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("meta", "ALTER TABLE orders ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'"),
 )
 
 
@@ -95,6 +102,19 @@ class Store:
     def _init_schema(self) -> None:
         with self._write_lock:
             self.conn.executescript(SCHEMA)
+            self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        """给已存在的老库补列。
+
+        ``CREATE TABLE IF NOT EXISTS`` 对已存在的表什么都不做，所以任何新增列
+        都必须在这里显式补上，否则老用户升级后会读不到新字段。
+        """
+        for column, ddl in _MIGRATIONS:
+            try:
+                self.conn.execute(f"SELECT {column} FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                self.conn.execute(ddl)
 
     def close(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -109,6 +129,12 @@ class Store:
             links = json.loads(row["links"] or "[]")
         except json.JSONDecodeError:
             links = []
+        try:
+            meta = json.loads(row["meta"] or "{}")
+        except (json.JSONDecodeError, IndexError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
         return Order(
             id=row["id"],
             external_id=row["external_id"],
@@ -126,6 +152,7 @@ class Store:
             file_size=row["file_size"],
             reply=row["reply"],
             error=row["error"],
+            meta=meta,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -139,17 +166,19 @@ class Store:
         text: str,
         sender: str = "",
         links: Iterable[dict[str, Any]] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> tuple[Order, bool]:
         """新建订单。返回 (order, created)；external_id 重复时返回已存在的订单。"""
         now = time.time()
         payload = json.dumps(list(links or []), ensure_ascii=False)
+        meta_payload = json.dumps(meta or {}, ensure_ascii=False)
         with self._write_lock:
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO orders "
                 "(external_id, channel, conversation_id, sender, text, status, links,"
-                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                " meta, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (external_id, channel, conversation_id, sender, text,
-                 OrderStatus.RECEIVED.value, payload, now, now),
+                 OrderStatus.RECEIVED.value, payload, meta_payload, now, now),
             )
             created = cur.rowcount > 0
             if created:
@@ -166,12 +195,14 @@ class Store:
         return order, created
 
     def update(self, order_id: int, **fields: Any) -> None:
-        """更新订单字段；links 可以是 list，自动序列化。"""
+        """更新订单字段；links / meta 可以是 dict/list，自动序列化。"""
         allowed = {k: v for k, v in fields.items() if k in _COLUMNS}
         if not allowed:
             return
         if "links" in allowed and not isinstance(allowed["links"], str):
             allowed["links"] = json.dumps(allowed["links"], ensure_ascii=False)
+        if "meta" in allowed and not isinstance(allowed["meta"], str):
+            allowed["meta"] = json.dumps(allowed["meta"] or {}, ensure_ascii=False)
         allowed["updated_at"] = time.time()
         assignments = ", ".join(f"{k}=?" for k in allowed)
         params = list(allowed.values()) + [order_id]

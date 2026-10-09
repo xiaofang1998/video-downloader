@@ -66,6 +66,9 @@ class IncomingMessage:
     sender: str = ""
     msg_id: str = ""
     ts: float = field(default_factory=time.time)
+    #: 渠道自定义的附加信息（原样落库，核心流水线不解释它）。
+    #: 闲鱼桥接用它携带 cookie_id / upstream_order_id，回传时才知道发给哪个账号。
+    meta: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.msg_id:
@@ -154,6 +157,8 @@ class Order:
     file_size: int = 0
     reply: str = ""
     error: str = ""
+    #: 渠道附加信息（见 IncomingMessage.meta）
+    meta: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
