@@ -394,5 +394,5 @@ def ensure_plain_mp4(path: str | Path, decode_key: object) -> tuple[bool, str]:
         return True, "无需解密"
     if parse_decode_key(decode_key) is None:
         return False, ("下载到的文件是视频号加密格式，但缺少 decode_key，无法解密。"
-                       "请配置 TikHub API key（会同时返回直链与 decode_key）")
+                       "请用 run.py channels-capture 抓一次（会同时拿到直链与 decode_key）")
     return decrypt_file(path, decode_key)

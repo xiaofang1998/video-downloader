@@ -857,37 +857,59 @@ def test_non_douyin_does_not_use_cdp(config: Config, tmp_path: Path, monkeypatch
     assert not called, "小红书不该触发抖音 CDP"
 
 
-def test_douyin_falls_back_to_cdp_when_tikhub_fails(config: Config, tmp_path: Path,
-                                                     monkeypatch):
-    """★ 抖音：TikHub 失败时，降级到登录态 CDP 本地解析。"""
-    from xydl.downloader import DownloadResult
+def test_douyin_uses_self_dev_cdp(monkeypatch, config: Config, tmp_path: Path):
+    """抖音/TikTok 走**自研**登录态 CDP 解析（不再依赖任何第三方付费服务）。
 
-    job = tmp_path / "job"
-    job.mkdir()
-    dl = Downloader(config)
+    自研链路：profile 存在就截页面自己带签名的请求拿
+    无水印直链；profile 不存在就明确提示先登录，而不是报一个看不懂的错。
+    """
+    import xydl.cdp_fetch as cdp
+    from xydl.models import DownloadResult
 
-    monkeypatch.setattr(dl, "prefer_ytdlp", True)
-    monkeypatch.setattr(type(dl.ytdlp), "available", property(lambda self: True))
-    # yt-dlp 失败
-    monkeypatch.setattr(dl.ytdlp, "download",
-                        lambda *a, **k: DownloadResult(False, engine="ytdlp", error="x"))
-    # TikHub 失败（额度用完）
-    monkeypatch.setattr("xydl.tikhub.resolve",
-                        lambda url, key: ("", "额度用完"))
-    # CDP 兜底成功
-    monkeypatch.setattr("xydl.cdp_fetch.fetch_douyin_video",
-                        lambda url, profile: ("https://cdn/dy.mp4", "测试视频"))
-    monkeypatch.setattr("xydl.cdp_fetch.login_profile_dir",
-                        lambda platform: tmp_path / "browser-login" / platform)
-    (tmp_path / "browser-login" / "douyin").mkdir(parents=True)
-    downloaded = {}
-    monkeypatch.setattr(dl.http, "download",
-                        lambda url, job_dir, **k: (
-                            downloaded.update(url=url) or
-                            DownloadResult(True, engine="http",
-                                           file_path=str(job / "ok.mp4"),
-                                           title=k.get("title_hint", ""), size_bytes=100)))
+    calls: dict = {}
 
-    result = dl.download("https://www.douyin.com/video/123", job)
-    assert result.ok is True
-    assert downloaded.get("url") == "https://cdn/dy.mp4"
+    def fake_profile(platform):
+        calls["platform"] = platform
+        return tmp_path / "profile"
+
+    def fake_fetch(url, profile):
+        calls["fetched"] = url
+        return "https://v3-web.douyinvod.com/abc/video.mp4", "示例标题"
+
+    monkeypatch.setattr(cdp, "login_profile_dir", fake_profile)
+    monkeypatch.setattr(cdp, "fetch_douyin_video", fake_fetch)
+    (tmp_path / "profile").mkdir()
+
+    config.set("download.prefer_ytdlp", False)
+    downloader = Downloader(config)
+    seen: dict = {}
+
+    class FakeHttp:
+        def download(self, url, job_dir, **kwargs):
+            seen["url"] = url
+            return DownloadResult(True, file_path=str(tmp_path / "v.mp4"),
+                                  engine="http", size_bytes=1)
+
+    monkeypatch.setattr(downloader, "http", FakeHttp())
+    monkeypatch.setattr(downloader.ytdlp, "_clean_job_dir", lambda _p: None)
+    result = downloader.download("https://v.douyin.com/abc/", tmp_path)
+    assert result.ok, result.error
+    assert calls["platform"] == "douyin"
+    assert seen["url"].endswith("video.mp4"), "应当用 CDP 拿到的直链去下"
+
+
+def test_douyin_without_login_says_what_to_do(monkeypatch, config: Config,
+                                              tmp_path: Path):
+    """没登录过时要说"先登录一次"，而不是抛异常或报一句看不懂的错误。"""
+    import xydl.cdp_fetch as cdp
+
+    monkeypatch.setattr(cdp, "login_profile_dir",
+                        lambda _platform: tmp_path / "missing-profile")
+    config.set("download.prefer_ytdlp", False)
+    downloader = Downloader(config)
+    monkeypatch.setattr(downloader.ytdlp, "_clean_job_dir", lambda _p: None)
+    result = downloader.download("https://v.douyin.com/abc/", tmp_path)
+    assert not result.ok
+    assert "登录" in result.error
+
+

@@ -245,85 +245,12 @@ def test_media_from_feed_dict_shapes():
         {"media": [{"url": "m1", "decode_key": "k"}]}) == ("m1", "k")
 
 
-# ── TikHub ────────────────────────────────────────────────────────────
-#: 取自 TikHub ``fetch_video_detail`` 的真实响应结构（只保留相关字段）
-TIKHUB_DETAIL = {
-    "id": "14396973035218999573",
-    "nickname": "某某作者",
-    "username": "v2_060000231003b20faec8c6e4811dc1d4c602ee30b0771bbcf220c67926bb76ab7702ac335a53@finder",
-    "createtime": 1760000000,
-    "object_nonce_id": "123",
-    "object_desc": {
-        "description": "出狱后，我举世无双-第1集",
-        "media_type": 4,
-        "media": [{
-            "url": "https://finder.video.qq.com/251/20302/stodownload?encfilekey=x",
-            "full_url": "",
-            "decode_key": "2136343393",
-            "file_size": 14088528,
-            "cover_url": "https://wxapp.tc.qq.com/cover",
-            "width": 720.0,
-            "height": 1280.0,
-            "codec_info": {"coding_format": "h265"},
-        }],
-    },
-}
-
-
-def test_parse_tikhub_media():
-    url, key, meta = wc.parse_tikhub_media(TIKHUB_DETAIL)
-    assert url.endswith("encfilekey=x")
-    assert key == "2136343393", "decode_key 必须与同一次响应的 url 配对返回"
-    assert meta["title"] == "出狱后，我举世无双-第1集"
-    assert meta["author"] == "某某作者"
-    assert meta["file_size"] == 14088528
-    assert meta["username"].startswith("v2_")
-
-
-def test_parse_tikhub_media_prefers_h264_for_compatibility():
-    data = json.loads(json.dumps(TIKHUB_DETAIL))
-    data["object_desc"]["media"] = [
-        {"url": "u265", "codec_info": {"coding_format": "h265"}},
-        {"url": "u264", "codec_info": {"coding_format": "h264"}},
-    ]
-    assert wc.parse_tikhub_media(data)[0] == "u264"
-
-
-def test_parse_tikhub_media_empty():
-    url, key, meta = wc.parse_tikhub_media({})
-    assert (url, key) == ("", "")
-    assert isinstance(meta, dict)
-    assert wc.parse_tikhub_media({"object_desc": {"media": []}})[0] == ""
-
-
-def test_tikhub_request_errors_are_described(monkeypatch, cfg):
-    monkeypatch.setattr(wc, "request", _StubRequest([
-        {"code": 400, "message": "bad request", "data": None}]))
-    data, error = wc.tikhub_video_detail(wc.parse_ref(SHARE_URL), "key")
-    assert not data
-    assert "bad request" in error
-
-
-# ── 解析门面 ──────────────────────────────────────────────────────────
 def test_resolve_media_uses_feed_direct_url(monkeypatch, cfg):
     monkeypatch.setattr(wc, "request", _StubRequest([PREVIEW_BODY]))
     feed = wc.fetch_feed_info(wc.parse_ref(SHARE_URL), cfg)
     feed.video_url = "https://finder.video.qq.com/v.mp4"
     media = wc.resolve_media(SHARE_URL, cfg, feed=feed, allow_browser=False)
     assert media.ok and media.via == "feed"
-
-
-def test_resolve_media_uses_tikhub_when_configured(monkeypatch, cfg):
-    cfg.set("delivery.tikhub.api_key", "test-key")
-    stub = _StubRequest([PREVIEW_BODY, {"code": 200, "data": TIKHUB_DETAIL}])
-    monkeypatch.setattr(wc, "request", stub)
-
-    media = wc.resolve_media(SHARE_URL, cfg, allow_browser=False)
-    assert media.ok
-    assert media.via == "tikhub"
-    assert media.decode_key == "2136343393"
-    # 第二次调用必须打的是 TikHub，而不是再问一次预览接口
-    assert "wechat_channels" in stub.calls[1]["url"]
 
 
 def test_resolve_media_reports_actionable_error(monkeypatch, cfg):
@@ -384,22 +311,6 @@ def test_resolve_media_bad_ref(cfg):
     assert not media.ok
 
 
-def test_list_series_without_tikhub(cfg):
-    feed = wc.ChannelsFeed(ok=True, title="出狱后，我举世无双-第1集")
-    items, note = wc.list_series(wc.parse_ref(SHARE_URL), cfg, feed)
-    assert items == []
-    assert "TikHub" in note
-
-
-def test_list_series_localizes_missing_title_pattern(cfg):
-    cfg.set("delivery.tikhub.api_key", "k")
-    feed = wc.ChannelsFeed(ok=True, title="随手拍的一天")
-    items, note = wc.list_series(wc.parse_ref(SHARE_URL), cfg, feed)
-    assert items == []
-    assert "剧集规律" in note
-
-
-# ── 浏览器抓包解析 ────────────────────────────────────────────────────
 def test_absorb_json_extracts_media_fields():
     capture = wc.BrowserCapture()
     wc._absorb_json(json.dumps({
@@ -464,31 +375,6 @@ def test_share_link_survives_full_resolve_chain(monkeypatch, tmp_path):
 
 
 # ── object_id 剧集（S3）：不白问匿名接口，也不拿空 URL 去起浏览器 ────────
-def test_resolve_media_skips_anonymous_api_for_object_id_only(monkeypatch, cfg):
-    """只有 object_id 时匿名接口一定不支持，别白花一次请求（合集一集一次）。"""
-    stub = _StubRequest([])
-    monkeypatch.setattr(wc, "request", stub)
-
-    ref = wc.ChannelsRef(object_id="14396973035218999573")
-    media = wc.resolve_media("", cfg, ref=ref, allow_browser=False)
-
-    assert not media.ok
-    assert stub.calls == [], "只有 object_id 时不该去问匿名预览接口"
-    assert "tikhub" in media.error.lower()
-
-
-def test_resolve_media_object_id_only_uses_tikhub(monkeypatch, cfg):
-    cfg.set("delivery.tikhub.api_key", "k")
-    stub = _StubRequest([{"code": 200, "data": TIKHUB_DETAIL}])
-    monkeypatch.setattr(wc, "request", stub)
-
-    ref = wc.ChannelsRef(object_id="14396973035218999573")
-    media = wc.resolve_media("", cfg, ref=ref, allow_browser=False)
-
-    assert media.ok and media.via == "tikhub"
-    assert stub.calls[0]["url"].endswith("fetch_video_detail")
-
-
 def test_capture_via_browser_refuses_empty_url(cfg):
     """只有 object_id 的集没有可打开的页面地址。
 
@@ -508,47 +394,6 @@ def test_capture_via_browser_refuses_empty_url(cfg):
 
 
 # ── 翻页（M5）：终止条件只认游标 ──────────────────────────────────────
-def test_paged_videos_stops_when_cursor_empty(monkeypatch):
-    """游标为空就停。
-
-    旧逻辑里 ``data.get("down_continue", bool(last_buffer))`` 在 down_continue
-    是对象时 ``bool({...})`` 恒为真，服务端说"没有下一页"也会继续打满 6 页，
-    白烧 API 额度。
-    """
-    calls: list[str] = []
-
-    def fake_post(endpoint, payload, api_key, **kwargs):
-        calls.append(str(payload.get("last_buffer")))
-        return {"videos": [{"id": "1", "description": "某某短剧-第1集"}],
-                "last_buffer": "",
-                "down_continue": {"has_more": True}}, ""
-
-    monkeypatch.setattr(wc, "_tikhub_post", fake_post)
-    episodes, error = wc._paged_videos("/x", {"username": "u"}, "k", limit=50)
-    assert error == ""
-    assert len(episodes) == 1
-    assert len(calls) == 1, f"游标为空必须立刻停，实际打了 {len(calls)} 页"
-
-
-def test_paged_videos_follows_cursor(monkeypatch):
-    """有游标就继续翻，并且把游标回传上去。"""
-    pages = [
-        ({"videos": [{"id": "1", "description": "第1集"}], "last_buffer": "CURSOR1"}, ""),
-        ({"videos": [{"id": "2", "description": "第2集"}], "last_buffer": ""}, ""),
-    ]
-    seen: list[str] = []
-
-    def fake_post(endpoint, payload, api_key, **kwargs):
-        seen.append(str(payload.get("last_buffer")))
-        return pages.pop(0)
-
-    monkeypatch.setattr(wc, "_tikhub_post", fake_post)
-    episodes, _ = wc._paged_videos("/x", {"username": "u"}, "k", limit=50)
-    assert seen == ["", "CURSOR1"]
-    assert [e.object_id for e in episodes] == ["1", "2"]
-
-
-# ── 元数据缓存：一次订单别问两遍 ──────────────────────────────────────
 def test_feed_info_is_cached(monkeypatch, cfg):
     """一次订单里「展开剧集」和「解析直链」都要 feed —— 只该问一次。"""
     stub = _StubRequest([PREVIEW_BODY, PREVIEW_BODY])
@@ -563,7 +408,7 @@ def test_feed_info_is_cached(monkeypatch, cfg):
 
 
 def test_feed_failures_are_not_cached(monkeypatch, cfg):
-    """失败不缓存：用户配好 TikHub/登录之后要能立刻拿到成功结果。"""
+    """失败不缓存：用户登录/改配置之后要能立刻拿到成功结果。"""
     stub = _StubRequest([
         {"errCode": -1, "errMsg": "permission verification failed"},
         PREVIEW_BODY,
@@ -688,7 +533,7 @@ def test_media_from_feed_dict_prefers_h264():
 
 
 def test_resolve_media_uses_token_link(tmp_path, cfg, monkeypatch):
-    """带 token 的链接走「匿名接口」这一步就要拿到直链（不需要 TikHub/抓包/登录）。"""
+    """带 token 的链接走「匿名接口」这一步就要拿到直链（不需要抓包/登录）。"""
     feed_body = {"errCode": 0, "data": {
         "feedInfo": {"description": "出狱后，我举世无双-第1集",
                      "coverUrl": "https://finder.video.qq.com/251/20350/stodownload?x=1",
@@ -788,7 +633,7 @@ CDN_VIDEO_URL = "https://finder.video.qq.com/251/20302/stodownload?encfilekey=ab
 
 
 def test_resolve_media_uses_local_capture(tmp_path, cfg, monkeypatch):
-    """本地抓包截到结果时，不用 TikHub 也能拿到直链 + decode_key。
+    """本地抓包截到结果时，不用登录也能拿到直链 + decode_key。
 
     这是"不依赖第三方"的唯一通道：微信 PC 客户端播一次 → 代理截下来 → 流水线用之。
     """
@@ -858,3 +703,51 @@ def test_live_preview_api(cfg):
     assert feed.ok, feed.error
     assert feed.title, "应该能拿到标题"
     assert feed.export_id.startswith("export/")
+
+# ── 去 TikHub 之后：视频号链路只走自研（元宝 / 匿名 feed / 本地抓包）──────
+def test_module_has_no_tikhub_leftovers():
+    """回归：模块里不许再有任何 TikHub 时代的符号/配置。
+
+    去掉第三方付费解析后，任何残留（常量、函数、配置读取）都会在上线后
+    变成"看起来支持其实调不通"的坑，所以用测试钉死。
+    """
+    for name in ("_tikhub_post", "tikhub_video_detail", "parse_tikhub_media",
+                 "TIKHUB_BASE", "TIKHUB_DETAIL_V2", "TIKHUB_USER_COLLECTIONS",
+                 "_paged_videos", "_collection_videos", "_user_videos"):
+        assert not hasattr(wc, name), f"还残留 TikHub 符号：{name}"
+    from pathlib import Path as _Path
+
+    source = _Path(wc.__file__).read_text(encoding="utf-8")
+    assert "tikhub" not in source.lower(), "源码里还有 TikHub 字样"
+
+
+def test_list_series_is_honest_without_client_context(cfg):
+    """视频号没有公开的作品列表接口：要如实说清怎么批量下，而不是假装成功。"""
+    feed = wc.ChannelsFeed(title="某剧-第3集")
+    episodes, message = wc.list_series(wc.ChannelsRef(short_uri="sph/x"), cfg, feed)
+    assert episodes == [], "拿不到列表就返回空，不能编"
+    assert "作品列表" in message or "列表" in message
+    assert "粘" in message, "要给出可操作的做法：把各集链接一起粘进来"
+
+
+def test_list_series_rejects_non_episodic_title(cfg):
+    """标题里没有「第 N 集」规律时，不该按剧集处理（否则"随手拍的一天"也会被当剧名）。"""
+    feed = wc.ChannelsFeed(title="随手拍的一天")
+    episodes, message = wc.list_series(wc.ChannelsRef(short_uri="sph/x"), cfg, feed)
+    assert episodes == []
+    assert "第 N 集" in message or "剧集" in message
+
+
+def test_object_id_only_error_points_to_yuanbao(cfg):
+    """只有 object_id 时（没有 shortUri/exportId）要告诉用户走元宝链路。
+
+    去 TikHub 之后这条路没有别的替代：拿不到 shortUri/exportId 就没有匿名入口，
+    也没有能打开的页面地址。所以错误信息必须是**可操作**的指引，
+    而不是让人去配一个已经不存在的付费 key。
+    """
+    ref = wc.ChannelsRef(object_id="14396973035218999573")
+    media = wc.resolve_media("", cfg, ref=ref, allow_browser=False)
+    assert not media.ok
+    message = media.error or ""
+    assert "元宝" in message or "token" in message, message
+    assert "tikhub" not in message.lower()

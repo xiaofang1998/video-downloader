@@ -172,7 +172,7 @@
       链接、分享文案、甚至只有一句标题都能识别。
       <br><b>B站</b> 分P / 合集 / 番剧 / UP主投稿会自动识别成多集，打包成 zip 交付。
       <br><b>微信视频号</b>：粘 <code>weixin.qq.com/sph/…</code> 短链后，工具会引导你去
-      <b>腾讯元宝</b>解析一次，把解析出的链接粘回来即可下载（不需要 TikHub）。
+      <b>腾讯元宝</b>解析一次，把解析出的链接粘回来即可下载（不需要登录、不需要抓包）。
       <br>没带链接时会用标题去 <b>Google / DuckDuckGo</b> 自动找源。
       <br>受版权保护的平台（腾讯视频、爱奇艺等）会自动识别并提示。
       <br><span class="kbd"><code>Ctrl</code> + <code>Enter</code></span> 快速开始
@@ -522,9 +522,9 @@ function renderChips(d){
     ([k,v]) => `<span class="chip">${k} <b>${v}</b></span>`
   ).join('')
     + `<span class="chip btn" onclick="revealDir()" title="${esc(d.download_dir||'')}">📁 下载目录</span>`
-    + `<span class="chip btn" onclick="loginPlatform('douyin')" title="登录态兜底：抖音（TikHub 额度不够时用）">🔑 登录抖音</span>`
+    + `<span class="chip btn" onclick="loginPlatform('douyin')" title="登录抖音（自研解析：登录一次即可长期用）">🔑 登录抖音</span>`
     + `<span class="chip btn" onclick="loginPlatform('tiktok')" title="登录态兜底：TikTok">🔑 登录TikTok</span>`
-    + `<span class="chip btn" onclick="loginPlatform('wechat_channels')" title="登录视频号助手（创作者后台，诊断用）。实测它拿不到别人视频的 mp4 —— 视频号下载请配 delivery.tikhub.api_key">🎬 视频号登录(诊断)</span>`
+    + `<span class="chip btn" onclick="loginPlatform('wechat_channels')" title="登录视频号助手（创作者后台，诊断用）。实测它拿不到别人视频的 mp4 —— 视频号下载请用元宝解析出带 token 的链接">🎬 视频号登录(诊断)</span>`
     + `<span class="chip" title="${esc((d.engines||[]).join(' / '))}">引擎 <b>${esc((d.engines||[])[0]||'-')}</b></span>`;
 }
 

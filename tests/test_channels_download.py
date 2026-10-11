@@ -74,14 +74,14 @@ def test_download_channels_media_decrypts_end_to_end(config, sample_server,
     job_dir = tmp_path / "job"
 
     media = wc.ChannelsMedia(ok=True, url=sample_server.url(CDN_NAME),
-                             title="某某短剧-第1集", decode_key=KEY, via="tikhub")
+                             title="某某短剧-第1集", decode_key=KEY, via="capture")
     result = downloader.download_channels_media(media, job_dir)
 
     assert result.ok, result.error
     assert result.engine == "wechat_channels+http"
     assert result.meta["decrypted"] is True
     assert result.meta["channels_decode_key"] == KEY
-    assert result.meta["channels_via"] == "tikhub"
+    assert result.meta["channels_via"] == "capture"
 
     head = Path(result.file_path).read_bytes()[:32]
     assert head == PLAIN_HEAD, "交付出去的必须是解密后的可播放 MP4"
@@ -210,7 +210,7 @@ def test_download_channels_url_wires_resolve_media(config, sample_server,
     def fake_resolve(url, cfg, **kwargs):
         return wc.ChannelsMedia(ok=True, url=sample_server.url(CDN_NAME),
                                 title="出狱后，我举世无双-第1集", decode_key=KEY,
-                                via="tikhub")
+                                via="capture")
 
     monkeypatch.setattr(wc, "resolve_media", fake_resolve)
     result = downloader.download_channels_url(
@@ -226,13 +226,13 @@ def test_download_channels_url_reports_resolve_failure(config, tmp_path,
     downloader = Downloader(config)
 
     monkeypatch.setattr(wc, "resolve_media", lambda url, cfg, **kw: wc.ChannelsMedia(
-        ok=False, error="TikHub：未配置 api_key｜建议：①填 delivery.tikhub.api_key"))
+        ok=False, error="视频号：这条链接里没有 token，请用腾讯元宝解析一次再粘回来"))
     result = downloader.download_channels_url(
         "https://weixin.qq.com/sph/AJizVCRhAt", tmp_path / "job")
 
     assert not result.ok
-    assert "TikHub" in result.error
-    assert "tikhub" in result.error
+    assert "元宝" in result.error
+    assert "token" in result.error
 
 
 def test_download_facade_routes_channels_urls(config, sample_server, tmp_path,
@@ -248,7 +248,7 @@ def test_download_facade_routes_channels_urls(config, sample_server, tmp_path,
 
     monkeypatch.setattr(wc, "resolve_media", lambda url, cfg, **kw: wc.ChannelsMedia(
         ok=True, url=sample_server.url(CDN_NAME), title="视频号视频", decode_key=KEY,
-        via="tikhub"))
+        via="capture"))
     monkeypatch.setattr(downloader.ytdlp, "download", fake_ytdlp)
 
     result = downloader.download("https://weixin.qq.com/sph/AJizVCRhAt",

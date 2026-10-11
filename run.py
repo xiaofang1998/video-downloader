@@ -606,7 +606,7 @@ def _apply_cookie_config(args, ck, report) -> None:
 
 
 def cmd_cdp_login(args) -> int:
-    """CDP 登录抖音/TikTok：登录态存进独立 profile，作为 TikHub 额度用完时的兜底。"""
+    """CDP 登录抖音/TikTok：登录态存进工具自己的 profile，之后下载自动用它解析。"""
     from xydl.cdp_fetch import login, login_profile_dir
 
     platform = (args.site or "douyin").lower()
@@ -620,7 +620,7 @@ def cmd_cdp_login(args) -> int:
     print("  会在弹出的 Edge 窗口里打开站点，请扫码登录，登录完成后关闭窗口。")
     print("  （不关窗口也行，这里只等 90 秒）\n")
     login(platform, url, wait_sec=90)
-    print(f"  ✓ 完成。之后下载 {platform} 时，TikHub 额度不够会自动切到这个登录态。")
+    print(f"  ✓ 完成。之后下载 {platform} 时，本工具就用这个登录态解析直链。")
     return 0
 
 
@@ -724,7 +724,7 @@ SELF_RESOLVED: frozenset[str] = frozenset({"kuaishou", "wechat_channels"})
 #: 自研兜底平台的说明（列表里显示给运营看）
 SELF_RESOLVED_NOTES: dict[str, str] = {
     "kuaishou": "自研 GraphQL 解析（快手反爬严，可能被滑块拦截）",
-    "wechat_channels": "自研解析：匿名拿标题/封面；mp4 需 TikHub key 或扫码登录",
+    "wechat_channels": "自研解析：元宝链路拿明文 MP4；本地抓包还能拿分辨率档位",
 }
 
 
@@ -801,12 +801,12 @@ def cmd_platforms(args) -> int:
     print("   · B站 的分P / 合集 / 番剧 / UP主投稿 会自动展开成 N 集，打包成 zip 交付")
     print("     想只下几集：config.json 里设 download.series.episode_range = \"1-10\"")
     print("     上限：download.series.max_episodes（默认 50）")
-    print("   · 视频号要靠 TikHub 才能列出剧集，否则只下当前这一集")
-    print("     先看一遍会下什么：run.py series <链接>")
+    print("   · 视频号没有公开的作品列表接口，默认只下当前这一集")
+    print("     想整部下：把各集的元宝解析链接一起粘进来（一行一条）")
     print()
     print("  关于视频号（重点）：")
-    print("   · 匿名只能拿到标题/封面；**mp4 目前只有一条实测可用的路**：")
-    print("     delivery.tikhub.api_key —— 一次返回直链 + decode_key")
+    print("   · 自研链路（不需要 key、不需要登录）：把视频号链接发给腾讯元宝，")
+    print("     它回一条带 token 的 feed 链接，把那条约链接粘回本工具即可下明文 MP4")
     print("   · 「扫码登录网页版再用浏览器抓」实测无效（2026-10）：预览页只渲染")
     print("     封面图 + 二维码，网页版 feed 页匿名返回 10012、登录了也拿不到媒体请求。")
     print("     run.py channels-login 只作为诊断入口保留，默认不参与下载。")
@@ -1020,7 +1020,7 @@ def cmd_wxinfo(args) -> int:
     ref = wc.parse_ref(url)
     print(f"  短码        {ref.short_uri or '（无）'}")
     print(f"  exportId    {ref.export_id or '（无）'}")
-    print(f"  TikHub 用    {ref.channel_id or '（无短码，只能走 exportId/objectId）'}")
+    print(f"  channel_id  {ref.channel_id or '（无短码，只能走 exportId/objectId）'}")
 
     print("\n① 匿名预览接口（不需要登录）")
     feed = wc.fetch_feed_info(ref, config)
@@ -1034,46 +1034,33 @@ def cmd_wxinfo(args) -> int:
     else:
         print(f"  ✗ {feed.error}")
 
-    key = str(config.get("delivery.tikhub.api_key", "") or "").strip()
-    print("\n② TikHub 直链解析")
-    if not key:
-        print("  ✗ 未配置 delivery.tikhub.api_key")
-        print("\n②b 本地抓包（不依赖 TikHub）")
-        from xydl import mitm as _mitm
-        from xydl import wxproxy as _wxproxy
+    print("\n② 本地抓包（自研兜底：微信里播一次就能截到直链 + decode_key）")
+    from xydl import mitm as _mitm
+    from xydl import wxproxy as _wxproxy
 
-        store = _wxproxy.CaptureStore(path=_wxproxy.capture_store_path(config))
-        print(f"  证书        {'已装' if _mitm.ca_installed() else '未装 → run.py channels-capture'}")
-        print(f"  已抓条目    {len(store.entries())} 条")
-        local = wc.resolve_media(url, config, feed=feed, allow_browser=False)
-        if local.ok:
-            print(f"  ✓ 直链：{snippet(local.url, 90)}")
-            print(f"    decode_key：{local.decode_key or '（无）'}   来源：{local.via}")
-            # 可选档位都列出来 —— 用户要的是"分辨率可选"，那就得先能看见有什么
-            if local.feed is not None and local.feed.raw:
-                cands = wc.feed_media_candidates(local.feed.raw.get("feedInfo") or {})
-                if cands:
-                    print("    可选档位    " + "、".join(
-                        c["label"] + (f"({c['height']}p)" if c["height"] else "")
-                        for c in cands))
-                    if local.quality:
-                        print(f"    实际选中    {local.quality}"
-                              f"（偏好 {config.get('download.quality') or 'compatible'}）")
-        else:
-            for attempt in local.attempts:
-                print(f"  · {attempt}")
-            if local.error:
-                # 这句才是运营真正需要的操作指引（短链要换成"复制链接"那种）
-                print(f"  → {snippet(local.error, 300)}")
+    store = _wxproxy.CaptureStore(path=_wxproxy.capture_store_path(config))
+    print(f"  证书        {'已装' if _mitm.ca_installed() else '未装 → run.py channels-capture'}")
+    print(f"  已抓条目    {len(store.entries())} 条")
+    local = wc.resolve_media(url, config, feed=feed, allow_browser=False)
+    if local.ok:
+        print(f"  ✓ 直链：{snippet(local.url, 90)}")
+        print(f"    decode_key：{local.decode_key or '（无）'}   来源：{local.via}")
+        # 可选档位都列出来 —— 用户要的是"分辨率可选"，那就得先能看见有什么
+        if local.feed is not None and local.feed.raw:
+            cands = wc.feed_media_candidates(local.feed.raw.get("feedInfo") or {})
+            if cands:
+                print("    可选档位    " + "、".join(
+                    c["label"] + (f"({c['height']}p)" if c["height"] else "")
+                    for c in cands))
+                if local.quality:
+                    print(f"    实际选中    {local.quality}"
+                          f"（偏好 {config.get('download.quality') or 'compatible'}）")
     else:
-        media = wc.resolve_media(url, config, feed=feed, allow_browser=False)
-        if media.ok:
-            print(f"  ✓ 直链：{snippet(media.url, 90)}")
-            print(f"    decode_key：{media.decode_key or '（无，可能不需要解密）'}")
-            print(f"    体积：{human_size(media.file_size) if media.file_size else '未知'}")
-        else:
-            for attempt in media.attempts:
-                print(f"  ✗ {attempt}")
+        for attempt in local.attempts:
+            print(f"  · {attempt}")
+        if local.error:
+            # 这句才是运营真正需要的操作指引（短链要换成"复制链接"那种）
+            print(f"  → {snippet(local.error, 300)}")
 
     profile = login_profile_dir("wechat_channels")
     print("\n③ 登录态浏览器抓取")
@@ -1100,7 +1087,8 @@ def cmd_wxinfo(args) -> int:
             print("    → 通道 ③ 可用，直接 `run.py download <链接>` 即可")
         else:
             print(f"  ✗ {capture.error}")
-            print("    → 通道 ③ 不可用，请配 delivery.tikhub.api_key（通道 ②）")
+            print("    → 抓包没拿到：先在微信里播一次这个视频再试，")
+            print("      或把元宝解析出的带 token 链接粘回本工具")
         print(f"  观察到的相关请求 {len(capture.visited)} 个"
               + ("：" if capture.visited else ""))
         for u in capture.visited[:6]:
@@ -1129,7 +1117,6 @@ def cmd_channels_login(args) -> int:
     from xydl import wechat_channels as wc
     from xydl.cdp_fetch import login_profile_dir
 
-    config = Config.load(args.config).apply_env_overrides()
     if getattr(args, "yuanbao", False):
         # 视频号下载的入口：元宝能把 /sph/xxx 短链换成带 token 的 playable_url
         from xydl import yuanbao
@@ -1152,12 +1139,8 @@ def cmd_channels_login(args) -> int:
     print(BANNER.format(version=__version__))
     print(f"  登录态目录   {profile}")
     print("  说明         用的是工具自管的 Edge profile，和你日常浏览器完全隔离")
-    # 顺手把"另一条通道"的状态说清楚：配了 TikHub 的话，其实不一定非要登录
-    if str(config.get("delivery.tikhub.api_key", "") or "").strip():
-        print("  提示         TikHub key 已配置 —— 那条通道不需要登录，"
-              "这里只是给「没有 key」或「TikHub 失败」时兜底")
-    else:
-        print("  提示         未配置 delivery.tikhub.api_key，所以登录这条通道是必需的")
+    # 说清楚这条登录通道的定位：日常下载走元宝链路，根本不需要登录。
+    print("  提示         本条登录只用于诊断；日常下载走元宝链路，不需要登录")
 
     if args.check:
         hits = [p for p in profile.rglob("Cookies") if p.is_file()]
@@ -1529,18 +1512,14 @@ def cmd_doctor(args) -> int:
     print("\n[微信视频号]")
     from xydl.cdp_fetch import login_profile_dir
 
-    print("  平台支持     解析链：匿名元数据 → TikHub 直链 → 登录态浏览器抓取")
-    key = str(config.get("delivery.tikhub.api_key", "") or "").strip()
-    if key:
-        print("  ① TikHub     ✓ 已配置 api_key（推荐通道：直链 + decode_key 一起来）")
-    else:
-        print("  ① TikHub     ✗ 未配置 delivery.tikhub.api_key")
-        print("                 → 不配的话只能拿到标题/封面，拿不到 mp4")
+    print("  平台支持     自研链路：腾讯元宝（token feed）→ 明文 MP4；"
+          "本地抓包可拿分辨率档位")
     # 用和 channels-login / 抓取完全同一个函数算路径 —— 三处各写一套的话，
     # 打包成 exe 后 ROOT 与 app_dir() 不一致，doctor 会误报"没登录过"
     profile = login_profile_dir("wechat_channels")
     logged = any(p.is_file() for p in profile.rglob("Cookies")) if profile.exists() else False
-    print(f"  ② 浏览器登录  {'✓ 已有登录态' if logged else '✗ 没登录过 → run.py channels-login'}")
+    print("  ① 元宝链路    ✓ 可用（把带 token 的 feed 链接粘回来即可下）")
+    print(f"  ② 浏览器登录  {'✓ 已有登录态' if logged else '✗ 没登录过（仅诊断用，不影响下载）'}")
     print(f"                 profile: {profile}")
     print(f"  ③ 自动解密    "
           f"{'✓ 开（视频号前 128KB 必须解密）' if config.get('download.wechat_channels.auto_decrypt', True) else '✗ 关（会交付打不开的文件）'}")
@@ -1881,7 +1860,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--test", help="配好后立刻用这条链接验证能不能解析")
     p.set_defaults(func=cmd_login)
 
-    p = sub.add_parser("cdp-login", help="CDP 登录抖音/TikTok（登录态兜底，TikHub 额度不够时用）")
+    p = sub.add_parser("cdp-login", help="CDP 登录抖音/TikTok（登录态，之后解析自动用它）")
     p.add_argument("site", nargs="?", default="douyin", help="douyin / tiktok")
     p.set_defaults(func=cmd_cdp_login)
 

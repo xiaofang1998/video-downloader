@@ -341,7 +341,7 @@ def test_token_protects_api(config: Config, store: Store):
 
 
 def test_cdp_login_endpoint(console, monkeypatch):
-    """★ 登录抖音/TikTok 的界面入口（TikHub 兜底）。"""
+    """★ 登录抖音/TikTok 的界面入口（自研 CDP 登录态）。"""
     import time
     called = {}
 

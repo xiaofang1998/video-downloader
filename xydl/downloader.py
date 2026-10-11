@@ -28,6 +28,7 @@ from typing import Callable
 
 from . import linkparse
 from . import utils
+from . import watermark as watermark_mod
 from . import wechat_channels
 from . import wxdecrypt
 from .config import Config, app_dir, bundle_dir
@@ -1141,7 +1142,8 @@ class Downloader:
     def download(self, url: str, job_dir: Path, *, kind: str = "page",
                  title_hint: str = "",
                  progress: ProgressCallback = _noop,
-                 cancel: threading.Event | None = None) -> DownloadResult:
+                 cancel: threading.Event | None = None,
+                 no_watermark: bool | None = None) -> DownloadResult:
         """两级降级：先 yt-dlp（能处理视频页/合流/HLS），再直链 HTTP。
 
         直链的 ``.mp4`` 用 yt-dlp 也是对的（它内部走 HTTP 并顺带拿元数据），
@@ -1149,7 +1151,14 @@ class Downloader:
 
         例外：微信视频号既没有 yt-dlp 解析器、也没有匿名直链，必须先经过
         :mod:`xydl.wechat_channels` 的解析链拿到 mp4 地址，再走直链下载 + 解密。
+
+        ``no_watermark``：是否**优先取无水印源**（``None`` 表示用配置
+        ``download.prefer_no_watermark``）。同一份视频平台常给多个地址
+        （抖音的 ``playwm`` 与 ``play`` 就是这样），据此排序挑选。
         """
+        prefer_no_watermark = (bool(self.config.get(
+            "download.prefer_no_watermark", True)) if no_watermark is None
+            else bool(no_watermark))
         job_dir = Path(job_dir)
         job_dir.mkdir(parents=True, exist_ok=True)
         # job_dir 是「单任务独享」目录：开跑前先清场。否则上一次任务残留的
@@ -1160,7 +1169,7 @@ class Downloader:
         attempts: list[str] = []
         cancelled = lambda: cancel is not None and cancel.is_set()  # noqa: E731
 
-        # 微信视频号：先解析出直链（TikHub / 登录态浏览器），再直链下载 + 解密。
+        # 微信视频号：先解析出直链（元宝链路 / 本地抓包），再直链下载 + 解密。
         # 不放进下面的 yt-dlp 降级链里，是因为 yt-dlp 对视频号**必然失败**，
         # 白跑一次只会多花几十秒还给出误导性的报错。
         if wechat_channels.is_channels_url(url):
@@ -1187,30 +1196,33 @@ class Downloader:
                 return result
             attempts.append(f"视频号 CDN：{result.error}")
 
-        # 抖音/TikTok/快手：yt-dlp 已过时（a_bogus 签名），优先走 TikHub 第三方解析，
-        # TikHub 失败/没配 key 时，抖音/TikTok 降级到「登录态 CDP」本地解析。
-        tikhub_key = str(self.config.get("delivery.tikhub.api_key", "") or "").strip()
-        if _is_douyin(url) or _is_tiktok(url) or is_kuaishou(url):
-            direct, caption = "", ""
-            if tikhub_key:
-                from .tikhub import resolve as tikhub_resolve
-                direct, caption = tikhub_resolve(url, tikhub_key)
-            # 抖音/TikTok 兜底：登录态 CDP（复用买家登录过的 profile）
-            if not direct and (_is_douyin(url) or _is_tiktok(url)):
-                from .cdp_fetch import fetch_douyin_video, login_profile_dir
-                platform = "douyin" if _is_douyin(url) else "tiktok"
-                profile = login_profile_dir(platform)
-                if profile.exists():
-                    direct, caption = fetch_douyin_video(url, profile)
-            if direct:
-                hint = title_hint or clean_media_title(caption, 60)
-                result = self.http.download(direct, job_dir, title_hint=hint,
-                                            progress=progress, cancel=cancel)
-                if result.ok or cancelled():
-                    return result
-                attempts.append(f"解析直链：{result.error}")
+        # 抖音 / TikTok：yt-dlp 对这两家已过时（a_bogus 等请求签名），
+        # 走**自研**通道：登录态 CDP —— 在买家自己的浏览器 profile 里打开页面，
+        # 截页面自己带签名发出的请求，拿**无水印**直链。
+        # 不依赖任何第三方付费解析服务。
+        if _is_douyin(url) or _is_tiktok(url):
+            from .cdp_fetch import fetch_douyin_video, login_profile_dir
+
+            platform = "douyin" if _is_douyin(url) else "tiktok"
+            profile = login_profile_dir(platform)
+            if not profile.exists():
+                attempts.append(f"{platform}：还没登录过（先用 login 命令登录一次即可自动解析）")
             else:
-                attempts.append("抖音/TikTok：TikHub 未配/失败，且无登录态（需先登录一次）")
+                direct, caption = fetch_douyin_video(url, profile)
+                if direct:
+                    direct, note = watermark_mod.pick_source(
+                        [direct], prefer_no_watermark=prefer_no_watermark)
+                    hint = title_hint or clean_media_title(caption, 60)
+                    result = self.http.download(direct, job_dir, title_hint=hint,
+                                                progress=progress, cancel=cancel)
+                    if result.ok or cancelled():
+                        if note:
+                            result.meta["watermark"] = note
+                        return result
+                    attempts.append(f"解析直链：{result.error}")
+                else:
+                    attempts.append(f"{platform}：CDP 没截到媒体地址"
+                                    "（页面可能需要登录，或在播放前就关掉了）")
 
         if self.prefer_ytdlp and self.ytdlp.available:
             result = self.ytdlp.download(url, job_dir, title_hint=title_hint,
@@ -1253,14 +1265,19 @@ class Downloader:
             else:
                 attempts.append(f"X/Twitter：{why or '镜像接口没有返回媒体'}")
 
-        # 快手：yt-dlp 已移除解析器，走自研 GraphQL 拿直链再下载
+        # 快手：yt-dlp 已移除解析器，走自研 GraphQL（visionVideoDetail）拿直链再下载
         if is_kuaishou(url):
             direct, caption = kuaishou_photo_url(url)
             if direct:
+                # 无水印优先：快手同一份视频也可能给多个地址
+                direct, note = watermark_mod.pick_source(
+                    [direct], prefer_no_watermark=prefer_no_watermark)
                 hint = title_hint or clean_media_title(caption, 60)
                 result = self.http.download(direct, job_dir, title_hint=hint,
                                             progress=progress, cancel=cancel)
                 if result.ok or cancelled():
+                    if note:
+                        result.meta["watermark"] = note
                     return result
                 attempts.append(f"快手直链：{result.error}")
             else:
@@ -1377,7 +1394,7 @@ class Downloader:
                                   ) -> DownloadResult:
         """按 ``object_id`` / ``export_id`` 下一集视频号作品。
 
-        合集里的每一集在 TikHub 的列表接口里只有 id（直链会过期，不能提前取），
+        合集里的每一集在列表里只有 id（直链会过期，不能提前取），
         所以这里必须为每一集单独解析一次直链再下载。
         """
         ref = wechat_channels.ChannelsRef(object_id=object_id or "",

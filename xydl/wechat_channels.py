@@ -26,10 +26,8 @@
   h264/h265 两种），**不需要登录、不需要抓包、也不需要解密**。
   反之 token 传空（只有 ``/sph/xxx`` 短链时）服务端会**剥离媒体字段**，只剩标题/封面 ——
   这是绕了很久才定位到的一步，全项目的"视频号能不能下"都取决于它。
-* ``tikhub``  —— 兜底。配了 ``delivery.tikhub.api_key`` 时走它，一次返回直链 +
-  ``decode_key``（这条拿到的是加密文件，需要 ISAAC64 解密）。
-* ``browser`` / ``capture`` —— 兜底里的兜底：本地抓包（见 :mod:`xydl.wxproxy`），
-  需要让微信 PC 客户端播一次视频。
+* ``capture`` —— 兜底：本地抓包（见 :mod:`xydl.wxproxy`），
+  需要让微信 PC 客户端播一次视频；抓到的 ``spec[]`` 还能给出真实分辨率档位。
 * ``browser`` —— 用 CDP 打开登录态 Edge 抓媒体请求。
   **2026-10 实测：对视频号无效，已默认关闭**（``download.wechat_channels.use_browser``）。
   证据（都在真实链接上跑出来的）：
@@ -47,10 +45,11 @@
 -------------------------
 视频号的"合集"和"同一部短剧的第 N 集"是两回事，但代下载场景里两种都要支持：
 
-* 有 TikHub：``channel_id → username → 合集列表 → 合集内视频``；合集里没有就退到
-  「该账号作品列表 + 标题前缀匹配」。
-* 没有 TikHub：只做**标题层面的剧集识别**（``XXX-第1集`` → 文件名/话术提示），
-  并明确告诉运营"要批量下需要配 TikHub 或先登录"。
+* 视频号**没有公开的匿名作品列表接口**，所以"自动列出整部剧"离不开客户端上下文
+  （注入/抓包）。本项目**不依赖任何第三方付费解析服务**，因此只做手里材料能支撑的事：
+  标题层面的剧集识别（``XXX-第1集`` → 文件名/话术提示）+ 明确告诉运营"把各集的
+  元宝解析链接一起粘进来即可批量下"。
+* 详见 :func:`list_series` 的说明。
 """
 
 from __future__ import annotations
@@ -199,7 +198,7 @@ class ChannelsRef:
 
     short_uri: str = ""          # 分享短码，如 AJizVCRhAt
     export_id: str = ""          # export/UzFfBgAA...（会过期）
-    object_id: str = ""          # 纯数字作品 id（TikHub 最优先）
+    object_id: str = ""          # 纯数字作品 id（剧集列表里只有它时会用到）
     #: 分享链接里的 ``token``。**这是能不能拿到 mp4 的关键**：
     #: 在微信里"复制链接"得到的是 ``/finder-preview/pages/feed?token=…&eid=…``，
     #: 把它放进请求体的 ``baseReq.generalToken`` 后，同一个接口就会下发
@@ -215,12 +214,12 @@ class ChannelsRef:
 
     @property
     def channel_id(self) -> str:
-        """TikHub 的 ``channel_id``：``sph`` + 短码。"""
+        """视频号的 ``channel_id``：``sph`` + 短码。"""
         return f"sph{self.short_uri}" if self.short_uri else ""
 
     @property
     def share_url(self) -> str:
-        """规范的分享短链（TikHub 的 ``share_url`` 只认这种形态）。"""
+        """规范的分享短链（各个消费侧入口都认这种形态）。"""
         return f"https://weixin.qq.com/sph/{self.short_uri}" if self.short_uri else ""
 
     @property
@@ -568,106 +567,6 @@ def _media_from_feed_dict(info: dict[str, Any]) -> tuple[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TikHub 解析
-# ══════════════════════════════════════════════════════════════════════
-TIKHUB_BASE = "https://api.tikhub.io"
-TIKHUB_DETAIL_V2 = "/api/v1/wechat_channels/v2/fetch_video_detail"
-TIKHUB_DETAIL_V1 = "/api/v1/wechat_channels/fetch_video_detail"
-TIKHUB_CHANNEL_TO_USERNAME = "/api/v1/wechat_channels/v2/fetch_channel_id_to_username"
-TIKHUB_USER_COLLECTIONS = "/api/v1/wechat_channels/v2/fetch_user_collections"
-TIKHUB_COLLECTION_VIDEOS = "/api/v1/wechat_channels/v2/fetch_collection_videos"
-TIKHUB_USER_VIDEOS = "/api/v1/wechat_channels/v2/fetch_user_videos"
-
-
-def _tikhub_post(endpoint: str, payload: dict[str, Any], api_key: str, *,
-                 timeout: float = 40.0) -> tuple[dict[str, Any], str]:
-    """POST 一个 TikHub 接口。返回 ``(data, error)``。"""
-    try:
-        resp = request(
-            "POST", TIKHUB_BASE + endpoint, json_body=payload,
-            headers={"Authorization": f"Bearer {api_key}",
-                     "Accept": "application/json"},
-            timeout=timeout, max_bytes=8 * 1024 * 1024,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {}, f"TikHub 请求异常：{type(exc).__name__}: {exc}"
-    if resp.error:
-        return {}, f"TikHub 网络错误：{resp.error}"
-    try:
-        body = resp.json()
-    except Exception:  # noqa: BLE001
-        return {}, f"TikHub 返回的不是 JSON（HTTP {resp.status}）"
-    if int(body.get("code") or 0) != 200:
-        return {}, (f"TikHub 错误（{body.get('code')}）："
-                    f"{body.get('message_zh') or body.get('message') or ''}")
-    return body.get("data") or {}, ""
-
-
-def tikhub_video_detail(ref: ChannelsRef, api_key: str, *,
-                        timeout: float = 40.0) -> tuple[dict[str, Any], str]:
-    """拿作品详情（含直链 + decode_key）。
-
-    v2 是按 ``object_id`` / ``export_id`` / ``share_url`` 三选一；
-    接口路径漂移过一轮（老版是 ``?id=``），所以 v2 失败时补一次老路径。
-    """
-    payload = {
-        "object_id": ref.object_id or "",
-        "export_id": ref.export_id or "",
-        "object_nonce_id": "",
-        "share_url": ref.share_url,
-        "raw": True,
-    }
-    data, error = _tikhub_post(TIKHUB_DETAIL_V2, payload, api_key, timeout=timeout)
-    if data:
-        return data, ""
-    legacy = ref.object_id or ref.short_uri
-    if legacy:
-        data2, error2 = _tikhub_post(TIKHUB_DETAIL_V1, {"id": legacy}, api_key,
-                                     timeout=timeout)
-        if data2:
-            return data2, ""
-        error = f"{error} / 老接口：{error2}"
-    return {}, error or "TikHub 没有返回数据"
-
-
-def parse_tikhub_media(data: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
-    """从 TikHub 详情里提 ``(直链, decode_key, 元信息)``。
-
-    关键：``url`` 与 ``decode_key`` **必须来自同一次响应**（每次请求都会变），
-    所以这里是一次性返回，绝不分开缓存。
-    """
-    if not isinstance(data, dict):
-        return "", "", {}
-    desc = data.get("object_desc") or data.get("objectDesc") or {}
-    media = desc.get("media") or []
-    meta = {
-        "title": clean_media_title(str(desc.get("description") or ""), 80),
-        "author": str(data.get("nickname") or ""),
-        "username": str(data.get("username") or ""),
-        "object_id": str(data.get("id") or ""),
-        "nonce_id": str(data.get("object_nonce_id") or ""),
-        "createtime": int(data.get("createtime") or 0),
-    }
-    if not isinstance(media, list):
-        return "", "", meta
-    # 优先 h264（兼容性最好），其次第一个带 url 的
-    ordered = sorted(
-        [m for m in media if isinstance(m, dict) and (m.get("url") or m.get("full_url"))],
-        key=lambda m: 0 if "h264" in str((m.get("codec_info") or {}).get("coding_format")
-                                        or m.get("coding_format") or "") else 1,
-    )
-    for item in ordered:
-        url = _first_url(item.get("url"), item.get("full_url"))
-        if url:
-            meta["file_size"] = int(item.get("file_size") or 0)
-            meta["cover_url"] = _first_url(item.get("cover_url"), item.get("thumb_url"))
-            meta["width"] = item.get("width")
-            meta["height"] = item.get("height")
-            return url, str(item.get("decode_key") or ""), meta
-    return "", "", meta
-
-
-# ══════════════════════════════════════════════════════════════════════
 #  浏览器（登录态 CDP）解析
 # ══════════════════════════════════════════════════════════════════════
 class BrowserCapture:
@@ -711,13 +610,13 @@ def capture_via_browser(ref: ChannelsRef, config: Config, *,
     # 打开网页版 feed 页：只有登录后的这个页面才会真正播放并请求视频流。
     # 预览页（finder-preview）刻意不放视频（只显示"扫码前往微信观看"），
     # 所以没有 exportId 时也去 feed 页试一下 —— 拿不到 exportId 的链接
-    # 至少能靠 TikHub 或匿名接口拿到标题。
+    # 至少能靠匿名接口拿到标题。
     target_url = ref.web_feed_url
     if not target_url:
         # 绝不把空串当 URL 传给 Edge：Edge 会把它当成"当前目录"，然后我们
         # 等 25 秒超时、报一句"可能被安全软件拦截"——把排查方向带偏。
         capture.error = ("这一集没有可打开的页面地址（只有 object_id），"
-                         "无法用浏览器抓取；请配 delivery.tikhub.api_key")
+                         "无法用浏览器抓取；请在元宝里解析出带 token/eid 的链接再粘回本工具")
         return capture
     port = _free_cdp_port(_pick_port() + 11)
     log(f"视频号：用登录态浏览器打开 {target_url}")
@@ -822,7 +721,7 @@ def capture_via_browser(ref: ChannelsRef, config: Config, *,
             capture.error = (
                 "浏览器里没有抓到视频直链。这条通道对视频号**实测无效**：预览页只渲染"
                 "封面图 + 二维码（'可扫码前往微信观看此内容'），网页版 feed 页匿名返回 "
-                "10012、带登录态也拿不到媒体请求。请配 delivery.tikhub.api_key。"
+                "10012、带登录态也拿不到媒体请求。请在元宝里解析出带 token/eid 的链接。"
             )
             log(f"视频号：浏览器里探测到 {len(capture.visited)} 个相关请求，"
                 f"但没有媒体地址")
@@ -979,7 +878,6 @@ def resolve_media(url: str, config: Config, *,
         except Exception as exc:                 # 元宝是入口增强项，坏了不能拖垮解析
             media.attempts.append(f"元宝：{type(exc).__name__}: {exc}")
 
-    tikhub_key = str(config.get("delivery.tikhub.api_key", "") or "").strip()
     # 匿名预览接口只认 shortUri / exportId；只有 objectId 时它一定失败
     # （实测），别白花一次请求 —— 合集一集一次，50 集就是 50 次。
     anonymous_usable = bool(ref.short_uri or ref.export_id)
@@ -1019,42 +917,17 @@ def resolve_media(url: str, config: Config, *,
         log("视频号：匿名接口直接下发了直链")
         return media
 
-    # 只有 object_id 的剧集：没有 TikHub 就无路可走，直接说清楚，
-    # 不要拉浏览器（那时连个能打开的 URL 都没有）。
-    if not anonymous_usable and not tikhub_key:
+    # 只有 object_id 的剧集：拿不到 shortUri/exportId 就没有匿名入口，
+    # 也没有浏览器能打开的页面地址 —— 直接说清楚该走哪条路，别让用户干等。
+    if not anonymous_usable:
         media.attempts.append("匿名接口：不支持只有 object_id 的链接")
-        media.attempts.append("TikHub：未配置 api_key")
         media.error = ("；".join(media.attempts)
-                       + "｜这一集只能按 object_id 定位，必须配 "
-                         "delivery.tikhub.api_key 才能下载")
+                       + "｜这一集只能按 object_id 定位：请在元宝里解析出带 "
+                         "token/eid 的链接再粘回本工具")
         return media
 
-    # ② TikHub（推荐的无人值守方案）
-    if tikhub_key:
-        data, error = tikhub_video_detail(ref, tikhub_key)
-        if data:
-            video_url, decode_key, meta = parse_tikhub_media(data)
-            if video_url:
-                media.ok = True
-                media.url = video_url
-                media.decode_key = decode_key
-                media.file_size = int(meta.get("file_size") or 0)
-                media.title = media.title or str(meta.get("title") or "")
-                media.via = "tikhub"
-                if feed is not None:
-                    feed.username = feed.username or str(meta.get("username") or "")
-                    feed.object_id = feed.object_id or str(meta.get("object_id") or "")
-                log(f"视频号：TikHub 解析成功（decode_key="
-                    f"{'有' if decode_key else '无'}）")
-                return media
-            media.attempts.append("TikHub：返回里没有可用媒体地址")
-        else:
-            media.attempts.append(f"TikHub：{error}")
-    else:
-        media.attempts.append("TikHub：未配置 api_key")
-
-    # ③ 本地抓包（`run.py channels-capture` 截到的 url + decode_key）
-    #    这是不依赖 TikHub 的唯一通道：微信 PC 客户端播一次，我们把它截下来。
+    # ② 本地抓包（`run.py channels-capture` 截到的 url + decode_key）
+    #    微信 PC 客户端播一次，我们把它截下来 —— 全程自研、不依赖付费服务。
     #    函数内导入 wxproxy：wxproxy 反过来 import 本模块，模块级导入会成环。
     try:
         from . import wxproxy as _wxproxy
@@ -1124,7 +997,7 @@ def resolve_media(url: str, config: Config, *,
             "② 把这条链接粘进元宝的对话框发出去；"
             "③ 元宝会回一条形如 "
             "`channels.weixin.qq.com/finder-preview/pages/feed?token=…&eid=…` 的链接，"
-            "把它复制后**粘回本工具**，就能直接下载（明文 MP4，不需要 TikHub）。"
+            "把它复制后**粘回本工具**，就能直接下载（明文 MP4）。"
         )
     else:
         media.error += ("｜链接里已经带了 token，但仍取不到媒体：可能已过期"
@@ -1193,130 +1066,27 @@ class ChannelEpisode:
 def list_series(ref: ChannelsRef, config: Config, feed: ChannelsFeed, *,
                 limit: int = 50, log: LogFn = _noop_log
                 ) -> tuple[list[ChannelEpisode], str]:
-    """列出同一部剧/同一个合集的其它集。返回 ``(集列表, 说明)``。
+    """列出同一部剧的其它集。返回 ``(集列表, 说明)``。
 
-    只有配了 TikHub 才可能真拿到列表（视频号没有公开的匿名列表接口）。
-    拿不到时返回空列表 + 一句人话，绝不假装成功。
+    **视频号没有公开的匿名作品列表接口**，所以任何"自动列出整部剧"的方案都得靠
+    客户端上下文（注入/抓包）。本工具不依赖第三方付费服务，因此这里只做
+    **手里已有材料**能支撑的事：
+
+    * 标题里有 ``第 N 集`` 这种规律 → 用于命名与话术提示（见 ``series_prefix``）
+    * 真正的批量下载：把每一集在元宝里解析出的链接**一起粘进本工具**（一行一条），
+      管线会当成多条链接逐条下好并按集号命名
+
+    拿不到就返回空列表 + 一句人话，**绝不假装成功**（假装成功比报错更坑：
+    买家以为在下一整部，结果只下了一集）。
     """
-    tikhub_key = str(config.get("delivery.tikhub.api_key", "") or "").strip()
-    if not tikhub_key:
-        return [], "未配置 TikHub，无法列出视频号剧集（本集可正常下载）"
-
-    # 标题里必须真的有"第 N 集"这种编号，否则"随手拍的一天"也会被当成剧名
-    # 去求一遍 username，白花一次 API 调用还给出误导性的提示。
     if series_episode_number(feed.title) is None:
-        return [], "标题里没有剧集规律，无法自动批量"
-
+        return [], "这条标题里没有「第 N 集」规律，看起来不是剧集"
     prefix = series_prefix(feed.title)
     if not prefix:
-        return [], "标题里没有剧名（只有集数），无法自动批量"
-
-    # 1) 短码 → finder username
-    username = feed.username
-    if not username and ref.channel_id:
-        data, error = _tikhub_post(TIKHUB_CHANNEL_TO_USERNAME,
-                                   {"channel_id": ref.channel_id, "raw": False},
-                                   tikhub_key)
-        if data:
-            username = str(data.get("username") or
-                           (data.get("data") or {}).get("username") or "")
-        elif error:
-            log(f"视频号：短码转 username 失败（{error}）")
-    if not username:
-        return [], "拿不到视频号账号 username，无法列出剧集"
-
-    # 2) 合集列表：挑名字对得上的合集
-    data, error = _tikhub_post(TIKHUB_USER_COLLECTIONS,
-                               {"username": username, "raw": False}, tikhub_key)
-    if data:
-        collections = data.get("collections") or (data.get("data") or {}).get(
-            "collections") or []
-        if not isinstance(collections, list):
-            collections = []
-        picked = None
-        for item in collections:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or item.get("title") or "")
-            # 合集名跟剧名互相包含就认为对得上（剧名常常是合集名的简写）
-            if prefix and name and (prefix in name or name in prefix):
-                picked = item
-                break
-        if picked is None and len(collections) == 1:
-            picked = collections[0]
-        topic_id = str((picked or {}).get("topic_id") or (picked or {}).get("id") or "")
-        if topic_id:
-            videos, err2 = _collection_videos(topic_id, tikhub_key, limit=limit)
-            if videos:
-                log(f"视频号：从合集「{(picked or {}).get('name', '')}」拿到 "
-                    f"{len(videos)} 集")
-                return videos, ""
-            if err2:
-                log(f"视频号：合集内视频拉取失败（{err2}）")
-    elif error:
-        log(f"视频号：合集列表拉取失败（{error}）")
-
-    # 3) 退到"账号作品列表 + 标题前缀匹配"
-    videos, error = _user_videos(username, tikhub_key, limit=limit)
-    if videos:
-        matched = [v for v in videos if series_prefix(v.title) == prefix]
-        if len(matched) >= 2:
-            log(f"视频号：按标题前缀「{prefix}」匹配到 {len(matched)} 集")
-            for idx, item in enumerate(matched, 1):
-                item.index = idx
-            return matched, ""
-        return [], f"账号作品里只有 {len(matched)} 条匹配「{prefix}」，凑不成剧集"
-    return [], error or "没有拿到视频号作品列表"
+        return [], "标题里只有集数没有剧名，无法按剧名归组"
+    log(f"视频号：识别到剧名「{prefix}」，但视频号没有公开的作品列表接口 —— "
+        f"要批量下请把各集的元宝链接一起粘进来（一行一条）")
+    return [], (f"视频号没有公开的作品列表接口，无法自动列出整部剧；"
+                f"把「{prefix}」各集的元宝解析链接一起粘进来即可批量下载")
 
 
-def _paged_videos(endpoint: str, payload: dict[str, Any], api_key: str, *,
-                  limit: int, max_pages: int = 6
-                  ) -> tuple[list[ChannelEpisode], str]:
-    """按 ``last_buffer`` 游标翻页拉视频列表。
-
-    终止条件**只认游标**：TikHub 的 ``down_continue`` 在不同版本里是 bool、
-    也可能是对象，拿它当条件既不统一、又可能白烧额度（``bool({...})`` 恒为真，
-    服务端说"没有下一页"时还会继续打满 6 页）。游标为空就是没有下一页 ——
-    这是唯一稳定的信号。
-    """
-    episodes: list[ChannelEpisode] = []
-    last_buffer = ""
-    for _ in range(max(1, max_pages)):
-        body = dict(payload)
-        body["last_buffer"] = last_buffer
-        data, error = _tikhub_post(endpoint, body, api_key)
-        if not data:
-            return episodes, error
-        videos = data.get("videos") or (data.get("data") or {}).get("videos") or []
-        for item in videos if isinstance(videos, list) else []:
-            if not isinstance(item, dict):
-                continue
-            episodes.append(ChannelEpisode(
-                index=len(episodes) + 1,
-                title=clean_media_title(str(item.get("description")
-                                            or item.get("title") or ""), 80),
-                object_id=str(item.get("id") or item.get("object_id") or ""),
-                export_id=str(item.get("export_id") or ""),
-            ))
-            if len(episodes) >= limit:
-                return episodes, ""
-        last_buffer = str(data.get("last_buffer")
-                          or (data.get("data") or {}).get("last_buffer") or "")
-        if not last_buffer:
-            break
-    return episodes, ""
-
-
-def _collection_videos(topic_id: str, api_key: str, *,
-                       limit: int = 50) -> tuple[list[ChannelEpisode], str]:
-    """拉合集内视频（``topic_type`` 16 是视频号合集的固定值）。"""
-    return _paged_videos(TIKHUB_COLLECTION_VIDEOS,
-                         {"topic_id": topic_id, "topic_type": 16, "raw": False},
-                         api_key, limit=limit)
-
-
-def _user_videos(username: str, api_key: str, *,
-                 limit: int = 50) -> tuple[list[ChannelEpisode], str]:
-    """拉某个视频号账号的作品列表。"""
-    return _paged_videos(TIKHUB_USER_VIDEOS, {"username": username, "raw": False},
-                         api_key, limit=limit)

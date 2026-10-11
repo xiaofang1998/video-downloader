@@ -383,7 +383,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _api_cdp_login(self) -> None:
         """触发登录（登录态存进独立 profile，作为第三方解析的兜底）。
 
-        抖音/TikTok 是 TikHub 的兜底；视频号则是**拿 mp4 的仅有两条第 2 条**
+        抖音/TikTok 走登录态 CDP；视频号则是**元宝链路之外的兜底**
         —— 匿名接口只给标题/封面。
         """
         length = int(self.headers.get("Content-Length", 0) or 0)

@@ -17,7 +17,7 @@
       https://www.bilibili.com/list/<...>             列表/收藏夹
 
 * **微信视频号**：见 :mod:`xydl.wechat_channels`。视频号没有公开的匿名列表接口，
-  所以只有配了 TikHub 才可能真正列出整部剧；否则退化成单集（并在 note 里说清楚）。
+  视频号没有公开的作品列表接口，所以这里**老实退化成单集**（并在 note 里说清楚）。
 
 设计要点：``--flat-playlist`` 只取轻量条目，**不解析每一集的详情**。
 因为每集真正的标题由下载引擎在下载时自己探测（`yt-dlp -J`），这里重复解析一遍
@@ -495,7 +495,7 @@ def _plan_channels(url: str, *, config: Config, title_hint: str,
                    feed: "wechat_channels.ChannelsFeed | None",
                    probe_limit: int, range_mode: bool = False,
                    log: LogFn = _noop_log) -> SeriesPlan:
-    """视频号：只有 TikHub 才能列出剧集；否则老实按单集处理。"""
+    """视频号：没有公开的作品列表接口，老实按单集处理。"""
     ref = wechat_channels.parse_ref(url)
     if feed is None:
         feed = wechat_channels.fetch_feed_info(ref, config)

@@ -79,6 +79,10 @@ DEFAULTS: dict[str, Any] = {
         "task_timeout_sec": 1800,
         # 是否优先用 yt-dlp（否则只用直链下载）
         "prefer_ytdlp": True,
+        # 是否**优先取无水印源**：平台常同时给带水印 / 无水印两份地址
+        # （抖音的 `playwm` 与 `play` 就是同一份视频的两个地址），开启后按无水印优先。
+        # 只有带水印版本时会在交付信息里如实标注"带水印源"，不会静默交付。
+        "prefer_no_watermark": True,
         # 传给 yt-dlp 的额外参数，按需自行追加
         "ytdlp_extra_args": [],
         # 例如 "chrome" / "edge"，从浏览器读 cookie；留空则不用。
@@ -126,7 +130,7 @@ DEFAULTS: dict[str, Any] = {
         },
         # ── 微信视频号 ─────────────────────────────────────────────
         # 视频号的分享短链（weixin.qq.com/sph/…）匿名只能拿到标题/封面。
-        # **mp4 目前只有一条真正可用的路：TikHub**（delivery.tikhub.api_key）。
+        # **mp4 走自研链路**：元宝解析出带 token/eid 的链接即可拿到明文 MP4。
         #
         # 为什么"扫码登录网页版然后用浏览器抓"这条路默认关掉了（2026-10 实测）：
         #   · finder-preview 预览页在**登录状态下也只渲染封面图 + 二维码**，
@@ -146,7 +150,7 @@ DEFAULTS: dict[str, Any] = {
             # 下载产物若是加密格式，自动解密（强烈建议保持 True）
             "auto_decrypt": True,
             # ── 本地抓包（`run.py channels-capture`）──────────────────
-            # 不依赖 TikHub 的唯一通道：本机架一个选择性 MITM 代理，把微信 PC
+            # 自研兜底通道：本机架一个选择性 MITM 代理，把微信 PC
             # 客户端播放视频时的媒体地址 + decode_key 截下来。
             # 只有装了证书（当前用户根证书库，不需要管理员）才会真的解密。
             "capture_store": "",          # 留空 = data/wx_capture.json
@@ -276,13 +280,6 @@ DEFAULTS: dict[str, Any] = {
         # 文件已经在网盘里了，只是没生成分享链接。
         "upload_only_note": "",
 
-        # ── TikHub 第三方解析（抖音/TikTok 无水印）────────────────
-        # 抖音/TikTok 的 a_bogus 签名本地逆向不现实，TikHub.io 在服务端维护了
-        # 签名算法。填上 API key（免费注册 + 每日签到领额度）后，下载抖音/TikTok
-        # 会自动走 TikHub 拿无水印直链。
-        "tikhub": {
-            "api_key": "",
-        },
 
         # ── 百度网盘 ────────────────────────────────────────────────
         "baidu": {

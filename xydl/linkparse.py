@@ -113,7 +113,7 @@ PLATFORMS: tuple[PlatformRule, ...] = (
                  ("channels.weixin.qq.com",),
                  short_domains=("weixin.qq.com",),
                  short_exact=True,
-                 note="视频号：匿名可拿标题/封面，mp4 需要 TikHub key 或扫码登录"),
+                 note="视频号：用元宝解析出带 token 的链接即可下（明文 MP4）"),
     # 公众号文章（跟视频号是两码事，混在一起会让 code 全走错分支）
     PlatformRule("wechat_mp", "微信公众号", ("mp.weixin.qq.com",),
                  note="公众号文章里的视频多为腾讯视频源，通常有版权保护"),

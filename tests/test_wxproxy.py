@@ -59,8 +59,8 @@ def test_extract_media_ignores_cover():
     assert wxproxy.extract_media({"coverUrl": COVER_URL, "decodeKey": "1"}) == []
 
 
-def test_extract_media_handles_tikhub_shape():
-    """TikHub 的结构（object_desc.media[0].decode_key 下划线版）也要认。"""
+def test_extract_media_handles_client_api_shape():
+    """客户端接口的结构（object_desc.media[0].decode_key 下划线版）也要认。"""
     payload = {"data": {"object_desc": {"media": [
         {"url": VIDEO_URL, "decode_key": 987654321, "title": "某剧"}]}}}
     hits = wxproxy.extract_media(payload)

@@ -1,6 +1,6 @@
 """CDP（Chrome DevTools Protocol）控制 Edge：登录态兜底解析抖音/TikTok。
 
-抖音/TikTok 的 a_bogus 签名本地逆向不现实，TikHub 是主力；这里提供**登录态兜底**：
+抖音/TikTok 的 a_bogus 签名本地逆向不现实，这里走**登录态 CDP**：
 用 CDP 启动 Edge（独立 profile），让用户登录一次，之后复用这个 profile 访问视频页，
 **拦截页面 JS 自动带签名发起的 detail 请求响应**，拿到无水印视频直链。
 

@@ -16,9 +16,9 @@
 | **链接识别** | 从一段中文 + emoji 里精确切出 URL，识别 30+ 平台，自动区分短链 / 完整页 / 直链 / 受保护平台 |
 | **短链展开** | `v.douyin.com` / `b23.tv` / `xhslink.cn` / `v.kuaishou.com` / `t.cn` / `youtu.be` / `weixin.qq.com/sph/…` … 跟随重定向直到落地地址 |
 | **标题落源** | 只发了一句标题、没发链接时，自动拿标题去 Google / DuckDuckGo 找原视频 |
-| **无水印下载** | 抖音 / TikTok / 快手走 TikHub 第三方解析（拿无水印直链），其余平台走 yt-dlp |
-| **多剧集 / 合集** | B站 分P / 合集 / 番剧 / UP主投稿 一条链接自动展开成 N 集，按 `01 02 03` 编号下载并打包成 zip；视频号短剧可走 TikHub 拉全剧 |
-| **微信视频号** | `weixin.qq.com/sph/…` 分享链接可直接识别；标题/作者/封面匿名可取，mp4 走 TikHub 或扫码登录；内置 ISAAC64 解密（前 128KB） |
+| **无水印下载** | 抖音 / TikTok 走自研登录态解析、快手走自研 GraphQL（都拿无水印直链），其余平台走 yt-dlp |
+| **多剧集 / 合集** | B站 分P / 合集 / 番剧 / UP主投稿 一条链接自动展开成 N 集，按 `01 02 03` 编号下载并打包成 zip；视频号短剧把各集链接一起粘进来即可批量下 |
+| **微信视频号** | `weixin.qq.com/sph/…` 分享链接可直接识别；标题/作者/封面匿名可取，mp4 用元宝解析出的带 token 链接直接下；内置 ISAAC64 解密（前 128KB） |
 | **多画质** | best / 1080 / 720 / 480 可选，B站 / YouTube 自动合流（内置 ffmpeg） |
 | **直链下载** | 拿到 `...mp4` 直链也能直接下 |
 | **受保护平台识别** | 腾讯视频 / 爱奇艺 / 优酷 / 芒果TV 会被识别为 DRM，不做无意义的尝试 |
@@ -38,12 +38,12 @@ start.bat platforms
 
 | 平台 | 结果 | 备注 |
 | --- | --- | --- |
-| 抖音 | ✅ 走 TikHub 第三方解析 | yt-dlp 已过时（`a_bogus` 签名），要 TikHub key 或登录态 |
-| TikTok | ✅ 走 TikHub 第三方解析 | 同上 |
-| 快手 | ✅ 走 TikHub 第三方解析 | 同上 |
+| 抖音 | ✅ 自研登录态 CDP | yt-dlp 已过时（`a_bogus` 签名），跑一次 `cdp-login douyin` 即可 |
+| TikTok | ✅ 自研登录态 CDP | 同上（`cdp-login tiktok`） |
+| 快手 | ✅ 自研 GraphQL 解析 | 反爬严，可能需浏览器访问一次 |
 | 小红书 | ✅ | 带不带 cookie 都行 |
 | 哔哩哔哩 | ✅（含 `b23.tv` 短链·多剧集） | 带不带 cookie 都行；分P/合集/番剧/UP主投稿自动展开 |
-| 微信视频号 | ⚠️ 自研解析（匿名拿元数据） | mp4 需 TikHub key 或扫码登录网页版，见下文专章 |
+| 微信视频号 | ✅ 自研解析（元宝链路拿明文 mp4） | 见下文专章；短链用元宝解析一次即可 |
 | YouTube | ✅ | 千万别给它带 cookie |
 | 直链 `.mp4` | ✅ 直接下载 | — |
 | 微博 | ⚠️ 需登录态 | 样本链接易失效 |
@@ -84,36 +84,20 @@ start.bat selftest                                  :: 离线自测
 
 启动成功后打开 <http://127.0.0.1:8765/>。
 
-> 💡 下载**抖音 / TikTok / 快手 / 微信视频号**需要 TikHub key 或登录态，见下一节；
+> 💡 下载**抖音 / TikTok / 快手**需要先登录一次（自研解析），**微信视频号**用元宝解析；
 > B站（含多剧集）/ YouTube / 小红书等开箱即用。
 
 ---
 
-## 抖音 / TikTok / 快手：走 TikHub 或登录态
+## 抖音 / TikTok / 快手：全自研解析
 
 这三个平台现在是 **`a_bogus` 请求签名**风控，yt-dlp 的解析器已经过时（带不带
-cookie 都没用，实测 `403 Uifid Not Found`）。本地逆向签名不现实，走两条路：
-
-### 主力：TikHub 第三方解析（推荐）
-
-[TikHub.io](https://tikhub.io) 在服务端维护了签名算法，一次 API 调用直接返回无水印直链：
-
-1. 注册 <https://user.tikhub.io>（邮箱即可）
-2. Dashboard 顶部点 **Check-in** 签到领每日免费额度（不签到可能下不了）
-3. **API Management → Pricing** 创建 API key，勾选**全部 Scopes** 保存
-4. 填进 `config.json`：
-
-```jsonc
-{ "delivery": { "tikhub": { "api_key": "你的key" } } }
-```
-
-填完重启即可。免费档按签到额度走，量大需付费。
-
-### 兜底：登录态（TikHub 额度不够时）
+cookie 都没用，实测 `403 Uifid Not Found`）。本地逆向签名不现实，所以走**自研登录态**：在工具自己的 Edge profile 里打开一次
+站点（扫码登录），之后解析时直接截页面**自己带签名发出**的请求，拿无水印直链 ——
+不依赖任何第三方付费服务。
 
 exe 界面顶部有 **🔑 登录抖音 / 🔑 登录TikTok** 按钮，点一下弹 Edge 扫码登录
-（登录态存在工具自己的 profile，与日常浏览器隔离）。之后 TikHub 额度用完时
-自动切到这个登录态本地解析。
+（登录态存在工具自己的 profile，与日常浏览器隔离），登录一次之后长期可用。
 
 命令行等价：`start.bat cdp-login douyin`（或 `tiktok`）。
 
@@ -155,14 +139,15 @@ zip 交付（客户拿到一堆同名 mp4 是排不出顺序的）。
 实现上只用 yt-dlp 的 `--flat-playlist -J`（**只取条目清单，不逐集解析详情**），
 所以一个 50 集的合集探测只要一次请求；每集真正的标题在下载时由 yt-dlp 自己探测。
 
-### 视频号：TikHub 才能列全剧
+### 视频号：整部剧怎么批量下
 
-视频号没有公开的匿名列表接口，所以：
+视频号**没有公开的匿名作品列表接口**，所以"自动列出整部剧"离不开客户端上下文
+（注入/抓包）。本项目不依赖第三方付费解析，因此走一条更实在的做法：
 
-- 配了 `delivery.tikhub.api_key`：`短码 → finder username → 合集列表 → 合集内视频`；
-  合集对不上时退到「该账号作品列表 + 标题前缀匹配」（`出狱后，我举世无双-第1集`
-  能识别出剧名 `出狱后，我举世无双`）。
-- 没配：只下当前这一集，并在日志里说明原因（不假装成功）。
+- 标题里的剧集规律会被识别（`出狱后，我举世无双-第1集` → 剧名 `出狱后，我举世无双`），
+  用于命名与日志提示；
+- **把各集在元宝里解析出的链接一起粘进来（一行一条）**，管线会逐条下好并按集号命名；
+- 拿不到就如实说明原因，**绝不假装成功**（假装成功比报错更坑：买家以为在下一整部）。
 
 ### 控制范围
 
@@ -256,9 +241,11 @@ https://weixin.qq.com/sph/AJizVCRhAt
 分享链接 → 短码/exportId
    ├─ ① 匿名预览接口  POST /finder-preview/api/feed/get_feed_info   ← 不需登录
    │      拿标题 / 作者 / 封面 / 点赞 / exportId（**拿不到 mp4**）
-   ├─ ② TikHub       POST /api/v1/wechat_channels/v2/fetch_video_detail
-   │      一次同时返回 直链 + decode_key   ← **目前唯一实测可用的路**
-   └─ ③ 登录态浏览器   CDP 打开 Edge 抓 finder.video.qq.com 的媒体请求
+   ├─ ② 元宝链路     把短链发给腾讯元宝 → 拿回带 token 的 feed 链接
+   │      → 匿名接口直接下发**明文 MP4**（不需要解密）
+   ├─ ③ 本地抓包     `channels-capture` 截微信 PC 客户端的媒体请求
+   │      顺带拿到 spec[] 全档位（分辨率可选）与 decode_key
+   └─ ④ 登录态浏览器   CDP 打开 Edge 抓 finder.video.qq.com 的媒体请求
           ⚠️ 实测无效，默认关闭（证据见下）
 ```
 
@@ -289,9 +276,9 @@ JPEG 当视频交付出去（这是"看起来成功"的那种事故）。
 > 返回的是 **JSON** `{"errCode":10012}`，浏览器打开一片空白、根本没有二维码。
 > 正确的登录页是 `/platform`。
 
-所以视频号现在**只有 TikHub 一条路**。社区里流传的另一种做法是「本机微信 PC 客户端
-+ 本地 mitm 代理抓包」，那需要装根证书、改系统代理、还要人工在客户端里点开视频，
-和一个无 GUI 的下载后端是两种形态，本项目不做。
+所以视频号现在的主路是**元宝链路**（带 token 的 feed 链接一次请求拿明文 MP4）。
+另外项目自带一条**本地抓包**兜底（`channels-capture`）：装根证书 + 改系统代理 +
+人工在客户端里点开一次视频，适合本机诊断与拿分辨率档位，默认关闭。
 
 ### 2. 下载到的文件前 128KB 是加密的
 
@@ -311,7 +298,7 @@ XOR 过的 MP4**：只有前 131072 字节加密，其余是明文。直接交�
 `decode_key` 与直链**必须来自同一次 API 响应**（每次请求都会变），所以代码里两者
 是一次性配对返回、一起入库的。
 
-### 怎么用：粘链接就行（不需要 TikHub）
+### 怎么用：粘链接就行（不需要登录、不需要抓包）
 
 在微信里对视频号视频点**"复制链接"**，得到的是这种形态：
 
@@ -335,8 +322,8 @@ start.bat wxinfo  "https://channels.weixin.qq.com/finder-preview/pages/feed?toke
 | **链接里的 token** | `feedInfo.videoUrl` + `h264VideoInfo` + `h265VideoInfo` —— **明文 MP4 直链** |
 
 所以：
-- **带 token 的分享链接** → 一条 HTTP 请求拿到直链，不需要 TikHub、不需要登录、不需要抓包、**也不需要解密**；
-- **只有 `/sph/xxx` 短链**（没有 token）→ 仍然只能拿元数据；这时才会去走 TikHub / 本地抓包。
+- **带 token 的分享链接** → 一条 HTTP 请求拿到直链，不需要登录、不需要抓包、**也不需要解密**；
+- **只有 `/sph/xxx` 短链**（没有 token）→ 只能拿元数据；用元宝解析一次换成带 token 的链接即可。
 - 清晰度选 **h264**（`X-snsvideoflag=xWT113`）：页面播放器偏向 h265，但我们要交付给客户，
   h265 在老手机/剪映上打不开，所以取兼容性更好的那条。
 
@@ -352,22 +339,18 @@ start.bat wxinfo  "https://channels.weixin.qq.com/finder-preview/pages/feed?toke
 start.bat wxinfo "https://channels.weixin.qq.com/finder-preview/pages/feed?token=…&eid=…"
 ```
 
-### 2b. 兜底：TikHub 或本地抓包
+### 2b. 兜底：本地抓包（自研）
 
-如果手上只有 `/sph/xxx` 短链、又必须拿到 mp4，还有两条兜底：
+如果手上只有 `/sph/xxx` 短链，先用元宝把它换成带 token 的 feed 链接；实在拿不到
+token 时，还有一条本地抓包兜底（见下一节）：让微信 PC 客户端播一次视频，在本机把
+它的媒体请求截下来（顺带能拿到 `spec[]` 分辨率档位与 `decode_key`）。
 
-```jsonc
-{ "delivery": { "tikhub": { "api_key": "你的key" } } }   // 一次返回直链 + decode_key
-```
-
-或本地抓包（见下一节），它需要让微信 PC 客户端播一次视频。
-
-> TikHub 那条返回的是**加密**文件（前 128KB ISAAC64），本项目会自动解密。
-> 带 token 的分享链接那条是**明文**，不需要解密 —— 两条路的产物都能直接交付。
+> 抓包拿到的是**加密**文件（前 128KB ISAAC64），本项目会自动解密；
+> 元宝那条是**明文**，不需要解密 —— 两条路的产物都能直接交付。
 
 ### 3. 兜底：内置本地抓包（`channels-capture`）
 
-只有在"拿不到 token 又不想用 TikHub"时才需要它：让微信 PC 客户端播这个视频，
+只有在"拿不到 token"时才需要它：让微信 PC 客户端播这个视频，
 在本机把它的流量截下来。这条路已经做进项目自己，不用装第三方工具：
 
 ```bat
@@ -491,8 +474,8 @@ start.bat download "https://finder.video.qq.com/251/20302/stodownload?encfilekey
 产物是 **`dist\视频下载工具.exe`（约 118MB，单文件）**，双击即用。用户第一次运行
 会在 exe 同级生成 `config.json` / `data` / `downloads` / `logs`。
 
-> 分发时抖音/TikTok/快手两种玩法：① 你统一把 TikHub key 配进 exe 旁的 config.json
-> （买家零操作）；② 让买家自己点「登录抖音/登录TikTok」走登录态兜底。其余平台开箱即用。
+> 分发时抖音/TikTok/快手：让买家点一次「登录抖音/登录TikTok」（登录态存在工具自己的
+> profile 里，长期有效），之后自动解析。其余平台开箱即用。
 
 ### 几个设计取舍
 
@@ -521,8 +504,8 @@ start.bat download "https://finder.video.qq.com/251/20302/stodownload?encfilekey
 ├── xydl/
 │   ├── linkparse.py              # 链接识别：URL 抽取 / 平台判定 / 分享文案清洗
 │   ├── resolver.py               # 短链展开 + 搜索落源
-│   ├── downloader.py             # yt-dlp + 直链 + TikHub + 快手 + ffmpeg
-│   ├── tikhub.py                 # TikHub 第三方解析（抖音/TikTok/快手无水印）
+│   ├── downloader.py             # 引擎降级：yt-dlp + 直链 + CDP/快手 + ffmpeg
+│   ├── watermark.py              # 无水印源优先 + ffmpeg delogo（像素级去水印）
 │   ├── cdp_fetch.py              # CDP 控制 Edge（登录态兜底）
 │   ├── cdp_cookies.py            # CDP 拿明文 cookie
 │   ├── pipeline.py               # 下载任务编排

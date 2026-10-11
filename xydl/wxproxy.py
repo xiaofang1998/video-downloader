@@ -89,7 +89,7 @@ def _first_str(node: dict, keys: tuple[str, ...]) -> str:
 def extract_media(payload: Any) -> list[MediaHit]:
     """递归找出所有「视频地址（+ 可能的 decode_key）」。
 
-    做成通用递归而不是写死字段路径：视频号的接口结构随版本变（TikHub 返回
+    做成通用递归而不是写死字段路径：视频号的接口结构随版本变（不同接口返回
     ``data.object_desc.media[0]``，网页接口又是另一套），写死必然很快失效。
     ``decode_key`` 常在父层，所以要"继承"着往下传。
     """
