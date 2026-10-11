@@ -451,8 +451,12 @@ class YtDlpEngine:
         args += ["--retries", "3", "--fragment-retries", "3", "--socket-timeout", "20"]
         return args + self.extra_args
 
-    def _format_chains(self) -> list[list[str]]:
+    def _format_chains(self, quality: str | None = None) -> list[list[str]]:
         """按优先级给出多套 ``-f`` 参数，前一套失败就换下一套。
+
+        ``quality``：``best`` / ``1080`` / ``720`` / ``480`` / ``360``；
+        不给就用配置里的 ``download.quality``（本项目支持按订单覆盖，
+        用户在下单时可以单独指定这一条下载什么分辨率）。
 
         为什么需要降级链：只给一套选择器时，遇到「站点只有 DASH 分离流」或
         「不存在符合画质要求的格式」就会直接失败。多备几套能显著提高成功率。
@@ -463,7 +467,8 @@ class YtDlpEngine:
         挑不到再退回站点给的最佳编码。
         """
         merge = self.has_ffmpeg()
-        height = {"1080": 1080, "720": 720, "480": 480, "360": 360}.get(self.quality)
+        want = str(quality or self.quality).strip().lower()
+        height = {"1080": 1080, "720": 720, "480": 480, "360": 360}.get(want)
         compatible = bool(self.config.get("download.prefer_compatible", True))
         h = f"[height<={height}]" if height else ""
         chains: list[list[str]] = []
@@ -576,7 +581,8 @@ class YtDlpEngine:
     def download(self, url: str, job_dir: Path, *,
                  title_hint: str = "",
                  progress: ProgressCallback = _noop,
-                 cancel: threading.Event | None = None) -> DownloadResult:
+                 cancel: threading.Event | None = None,
+                 quality: str | None = None) -> DownloadResult:
         started = time.time()
         base = self._resolve_base_cmd()
         if base is None:
@@ -606,7 +612,7 @@ class YtDlpEngine:
 
         progress(Progress(percent=0.0, stage="启动下载", total=self._estimate_size(meta)))
 
-        chains = self._format_chains()
+        chains = self._format_chains(quality)
         last: DownloadResult | None = None
         for attempt, fmt_args in enumerate(chains, 1):
             stage = ("下载中" if attempt == 1
@@ -1143,7 +1149,59 @@ class Downloader:
                  title_hint: str = "",
                  progress: ProgressCallback = _noop,
                  cancel: threading.Event | None = None,
+                 quality: str | None = None,
+                 watermark: str | None = None,
                  no_watermark: bool | None = None) -> DownloadResult:
+        """下载入口：负责**水印策略**，实际下载交给 :meth:`_download_inner`。
+
+        ``quality``：``best`` / ``1080`` / ``720`` / ``480`` / ``360``（按订单覆盖
+        配置里的 ``download.quality``）。支持的站点交给 yt-dlp 的 ``-f`` 选择器，
+        视频号则交给 ``spec[]``/编码档位挑选。
+
+        ``watermark``：见 :data:`xydl.watermark.WATERMARK_MODES`
+
+        * ``auto``（默认）—— 优先无水印源，只有带水印版本时如实标注
+        * ``off`` —— 只接受无水印源，拿不到就报错（宁可不交也不交带水印的）
+        * ``delogo`` —— 优先无水印源；只有带水印版本时用 ffmpeg 擦掉（**有损**）
+        * ``any`` —— 不挑，拿到哪个算哪个
+
+        ``no_watermark``：旧参数，``False`` 等价于 ``watermark="any"``。
+        """
+        mode = str(watermark or self.config.get("download.watermark", "auto")
+                   or "auto").strip().lower()
+        if mode not in watermark_mod.WATERMARK_MODES:
+            mode = "auto"
+        if no_watermark is False and watermark is None:
+            mode = "any"
+
+        result = self._download_inner(url, job_dir, kind=kind,
+                                      title_hint=title_hint, progress=progress,
+                                      cancel=cancel, quality=quality,
+                                      watermark_mode=mode)
+        # 只有带水印版本时才需要后处理（干净源本来就没什么可擦的）
+        if result.ok and mode == "delogo" and result.meta.get("watermark"):
+            ffmpeg = self.ytdlp.find_ffmpeg()
+            if not ffmpeg:
+                result.meta["delogo_error"] = "没找到 ffmpeg，无法擦水印"
+            else:
+                ok, path, message = watermark_mod.delogo_file(
+                    ffmpeg, result.file_path,
+                    platform=watermark_mod.guess_platform(url),
+                    rect=str(self.config.get("download.delogo_rect", "") or ""))
+                if ok:
+                    result.file_path = path
+                    result.meta["delogo"] = message
+                    result.meta.pop("watermark", None)     # 已处理，不再是"带水印源"
+                else:
+                    result.meta["delogo_error"] = message
+        return result
+
+    def _download_inner(self, url: str, job_dir: Path, *, kind: str = "page",
+                        title_hint: str = "",
+                        progress: ProgressCallback = _noop,
+                        cancel: threading.Event | None = None,
+                        quality: str | None = None,
+                        watermark_mode: str = "auto") -> DownloadResult:
         """两级降级：先 yt-dlp（能处理视频页/合流/HLS），再直链 HTTP。
 
         直链的 ``.mp4`` 用 yt-dlp 也是对的（它内部走 HTTP 并顺带拿元数据），
@@ -1152,13 +1210,12 @@ class Downloader:
         例外：微信视频号既没有 yt-dlp 解析器、也没有匿名直链，必须先经过
         :mod:`xydl.wechat_channels` 的解析链拿到 mp4 地址，再走直链下载 + 解密。
 
-        ``no_watermark``：是否**优先取无水印源**（``None`` 表示用配置
-        ``download.prefer_no_watermark``）。同一份视频平台常给多个地址
-        （抖音的 ``playwm`` 与 ``play`` 就是这样），据此排序挑选。
+        ``watermark_mode`` 决定候选地址的挑选与"带水印"时是否继续下载。
         """
-        prefer_no_watermark = (bool(self.config.get(
-            "download.prefer_no_watermark", True)) if no_watermark is None
-            else bool(no_watermark))
+        prefer_no_watermark = watermark_mode != "any"
+        allow_watermarked = watermark_mode != "off"
+        # any 模式是"我不挑"：拿到带水印的也不标注（用户明确说了不在乎）
+        mark_watermarked = watermark_mode != "any"
         job_dir = Path(job_dir)
         job_dir.mkdir(parents=True, exist_ok=True)
         # job_dir 是「单任务独享」目录：开跑前先清场。否则上一次任务残留的
@@ -1173,8 +1230,10 @@ class Downloader:
         # 不放进下面的 yt-dlp 降级链里，是因为 yt-dlp 对视频号**必然失败**，
         # 白跑一次只会多花几十秒还给出误导性的报错。
         if wechat_channels.is_channels_url(url):
+            channel_arg = {"quality": quality} if quality else {}
             result = self.download_channels_url(
-                url, job_dir, title_hint=title_hint, progress=progress, cancel=cancel)
+                url, job_dir, title_hint=title_hint, progress=progress,
+                cancel=cancel, **channel_arg)
             if result.ok or cancelled():
                 return result
             attempts.append(f"视频号：{result.error}")
@@ -1210,23 +1269,26 @@ class Downloader:
             else:
                 direct, caption = fetch_douyin_video(url, profile)
                 if direct:
-                    direct, note = watermark_mod.pick_source(
-                        [direct], prefer_no_watermark=prefer_no_watermark)
                     hint = title_hint or clean_media_title(caption, 60)
-                    result = self.http.download(direct, job_dir, title_hint=hint,
-                                                progress=progress, cancel=cancel)
-                    if result.ok or cancelled():
-                        if note:
-                            result.meta["watermark"] = note
-                        return result
-                    attempts.append(f"解析直链：{result.error}")
+                    candidates = watermark_mod.order_candidates(
+                        [direct], prefer_no_watermark=prefer_no_watermark)
+                    done = self._try_candidates(
+                        candidates, job_dir, hint=hint, progress=progress,
+                        cancel=cancel, allow_watermarked=allow_watermarked,
+                        mark_watermarked=mark_watermarked,
+                        attempts=attempts, label=platform)
+                    if done is not None:
+                        return done
                 else:
                     attempts.append(f"{platform}：CDP 没截到媒体地址"
                                     "（页面可能需要登录，或在播放前就关掉了）")
 
         if self.prefer_ytdlp and self.ytdlp.available:
+            # 只在显式指定清晰度时才传这个参数：不改动引擎的既有调用约定
+            quality_arg = {"quality": quality} if quality else {}
             result = self.ytdlp.download(url, job_dir, title_hint=title_hint,
-                                         progress=progress, cancel=cancel)
+                                         progress=progress, cancel=cancel,
+                                         **quality_arg)
             if result.ok or cancelled():
                 return result
             attempts.append(f"yt-dlp：{result.error}")
@@ -1270,16 +1332,16 @@ class Downloader:
             direct, caption = kuaishou_photo_url(url)
             if direct:
                 # 无水印优先：快手同一份视频也可能给多个地址
-                direct, note = watermark_mod.pick_source(
-                    [direct], prefer_no_watermark=prefer_no_watermark)
                 hint = title_hint or clean_media_title(caption, 60)
-                result = self.http.download(direct, job_dir, title_hint=hint,
-                                            progress=progress, cancel=cancel)
-                if result.ok or cancelled():
-                    if note:
-                        result.meta["watermark"] = note
-                    return result
-                attempts.append(f"快手直链：{result.error}")
+                candidates = watermark_mod.order_candidates(
+                    [direct], prefer_no_watermark=prefer_no_watermark)
+                done = self._try_candidates(
+                    candidates, job_dir, hint=hint, progress=progress,
+                    cancel=cancel, allow_watermarked=allow_watermarked,
+                    mark_watermarked=mark_watermarked,
+                    attempts=attempts, label="快手")
+                if done is not None:
+                    return done
             else:
                 attempts.append("快手：解析被风控拦截（需浏览器访问一次快手后重试）")
 
@@ -1296,18 +1358,66 @@ class Downloader:
 
         return DownloadResult(False, engine="", error="；".join(attempts))
 
+    def _try_candidates(self, candidates: list[str], job_dir: Path, *, hint: str,
+                        progress: ProgressCallback,
+                        cancel: threading.Event | None,
+                        allow_watermarked: bool, mark_watermarked: bool,
+                        attempts: list[str],
+                        label: str) -> DownloadResult | None:
+        """按顺序试候选直链：**无水印优先，带水印兜底**。
+
+        为什么不是"挑一个就下"：无水印的地址常常是**改写**出来的
+        （``playwm`` → ``play``），平台不保证真的存在；这时要自动退回带水印
+        那一份，而不是直接失败。
+
+        ``allow_watermarked=False``（``watermark=off``）时干脆不试带水印的；
+        ``mark_watermarked=False``（``watermark=any``）时用户说了不挑，也就不标注。
+        返回 ``None`` 表示这一批候选都没成（原因已 append 进 ``attempts``）。
+        """
+        usable = [url for url in candidates
+                  if allow_watermarked or not watermark_mod.looks_watermarked(url)]
+        if not usable:
+            attempts.append(f"{label}：只有带水印版本，当前设置为「只要无水印源」")
+            return None
+        for url in usable:
+            result = self.http.download(url, job_dir, title_hint=hint,
+                                        progress=progress, cancel=cancel)
+            if result.ok or (cancel is not None and cancel.is_set()):
+                if mark_watermarked and watermark_mod.looks_watermarked(url):
+                    result.meta["watermark"] = "带水印源"
+                return result
+            attempts.append(f"{label}：{result.error}")
+        # 干净版都试过且都失败了，而平台确实只有带水印版本 → 说清楚，
+        # 否则用户只看到一句 404，不知道"其实带水印的那份是能下的"。
+        if not allow_watermarked and any(watermark_mod.looks_watermarked(url)
+                                        for url in candidates):
+            attempts.append(f"{label}：干净源不可用（平台只有带水印版本，"
+                            "当前设置为「只要无水印源」）")
+        return None
+
     # ── 微信视频号 ─────────────────────────────────────────────────
     def download_channels_url(self, url: str, job_dir: Path, *,
                               title_hint: str = "",
                               progress: ProgressCallback = _noop,
                               cancel: threading.Event | None = None,
+                              quality: str | None = None,
                               ) -> DownloadResult:
-        """解析视频号链接 → 直链下载 → 解密。"""
+        """解析视频号链接 → 直链下载 → 解密。
+
+        ``quality``：按本条订单覆盖清晰度偏好（``1080`` / ``720`` / ``best`` …）。
+        视频号这条路服务端常只给源里那一档，但抓到 ``spec[]``（客户端抓包）时
+        就能按这个偏好真正选档位 —— 所以要用**配置副本**传进去，不动全局配置。
+        """
         def log(message: str) -> None:
             # 视频号解析链路的中间结论要留在日志里，否则失败了很难排查
             progress(Progress(percent=0.0, stage=message))
 
-        media = wechat_channels.resolve_media(url, self.config, log=log)
+        config = self.config
+        if quality:
+            config = self.config.copy()
+            config.set("download.quality", quality)
+            log(f"本单清晰度偏好：{quality}")
+        media = wechat_channels.resolve_media(url, config, log=log)
         if not media.ok:
             return DownloadResult(False, engine="wechat_channels",
                                   title=title_hint or media.title,

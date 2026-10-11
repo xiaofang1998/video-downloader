@@ -176,3 +176,108 @@ def preset_label(platform: str) -> str:
     """预设的人话名字（给日志/帮助用）。"""
     preset = DELOGO_PRESETS.get((platform or "").strip().lower())
     return str(preset["label"]) if preset else ""
+
+
+#: 水印处理模式（下载时的选项；WebUI 与命令行共用这套值）
+WATERMARK_MODES: dict[str, str] = {
+    "auto": "优先无水印源；只有带水印版本时如实标注（默认）",
+    "off": "只要无水印源；拿不到就报错（不交付带水印的）",
+    "delogo": "优先无水印源；只有带水印版本时用 ffmpeg 擦掉（有损）",
+    "any": "不挑，拿到哪个算哪个（不标注）",
+}
+
+
+def guess_platform(url: str) -> str:
+    """从链接猜平台（用于选 delogo 预设）。猜不出返回空串。"""
+    text = (url or "").lower()
+    if "douyin.com" in text or "iesdouyin" in text:
+        return "douyin"
+    if "tiktok.com" in text:
+        return "tiktok"
+    if "kuaishou.com" in text or "gifshow.com" in text:
+        return "kuaishou"
+    if "channels.weixin.qq.com" in text or "weixin.qq.com/sph" in text:
+        return "wechat_channels"
+    if "xiaohongshu.com" in text or "xhslink" in text:
+        return "xiaohongshu"
+    return ""
+
+
+def probe_size(ffmpeg: str, path) -> tuple[int, int]:
+    """读视频分辨率。优先用同目录的 ffprobe，没有就解析 ``ffmpeg -i`` 输出。
+
+    ``(0, 0)`` 表示拿不到 —— 调用方应提示"用 --rect 手动指定"，别硬猜。
+    """
+    import re
+    import subprocess
+    from pathlib import Path
+
+    target = Path(path)
+    probe = Path(ffmpeg).with_name("ffprobe.exe"
+                                   if str(ffmpeg).lower().endswith(".exe") else "ffprobe")
+    if probe.exists():
+        try:
+            out = subprocess.run(
+                [str(probe), "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                 str(target)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            ).stdout
+            match = re.search(r"(\d+)\D+(\d+)", out or "")
+            if match:
+                return int(match.group(1)), int(match.group(2))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:                       # 退路：ffmpeg -i 会把流信息打到 stderr
+        proc = subprocess.run([ffmpeg, "-hide_banner", "-i", str(target)],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=60,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        match = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", proc.stderr or "")
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 0, 0
+
+
+def delogo_file(ffmpeg: str, src, *, platform: str = "", rect: str = "",
+                out=None, dry_run: bool = False) -> tuple[bool, str, str]:
+    """用 ffmpeg ``delogo`` 把水印区域盖掉。返回 ``(成功, 产物路径, 说明)``。
+
+    这是**有损**处理：用周边像素插值填充，会留淡淡痕迹、局部画质下降。所以只在
+    用户明确要求（``--watermark delogo`` / ``run.py delogo``）时才做。
+
+    ``platform`` 走预设比例、``rect`` 直接给 ``x:y:w:h``；两者都没有就报错 ——
+    绝不"猜一个区域"乱盖（盖错地方比不盖更糟）。
+    """
+    import subprocess
+    from pathlib import Path
+
+    source = Path(src)
+    if not source.is_file():
+        return False, "", f"找不到文件：{source}"
+    width, height = probe_size(ffmpeg, source)
+    try:
+        x, y, w, h = rect_for(platform, width, height, rect=rect)
+    except ValueError as exc:
+        return False, "", str(exc)
+
+    target = Path(out) if out else source.with_name(f"{source.stem}.nowm{source.suffix}")
+    if dry_run:
+        return True, str(target), (f"[dry-run] {delogo_filter(x, y, w, h)}"
+                                   f"（源 {width}x{height}）")
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+           "-i", str(source), "-vf", delogo_filter(x, y, w, h),
+           "-c:a", "copy", str(target)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=1800,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "", f"ffmpeg 执行失败：{type(exc).__name__}: {exc}"
+    if proc.returncode != 0 or not target.is_file():
+        return False, "", f"ffmpeg 返回 {proc.returncode}：{(proc.stderr or '')[-300:]}"
+    return True, str(target), (f"已擦除水印区域 {w}x{h} @ ({x},{y})"
+                               f"（源 {width}x{height}，有损处理）")

@@ -109,6 +109,43 @@ def test_state_endpoint_shape(console):
         assert key in data
 
 
+def test_state_endpoint_exposes_download_options(console):
+    """★ 清晰度 / 水印处理的下拉选项由后端给：命令行与界面共用同一套取值。
+
+    前端不写死这些值 —— 否则加一个档位要改两处，还容易出现"界面能选、
+    后端不认"的假选项。
+    """
+    api, _, _ = console
+    data = api.get_json("/api/state")
+    assert "best" in data["qualities"] and "1080" in data["qualities"]
+    modes = {item["value"] for item in data["watermark_modes"]}
+    assert {"auto", "off", "delogo", "any"} <= modes
+    for item in data["watermark_modes"]:
+        assert item["label"], "每个模式都要有给人看的说明"
+
+
+def test_create_order_keeps_quality_and_watermark(console, store):
+    """下单时选的清晰度/水印处理要落到**订单 meta**（只对这一单生效）。
+
+    不能改全局配置：并发下单时 A 单的选择会串到 B 单上（选集那个 bug 就是这样）。
+    """
+    api, _, _ = console
+    data = api.post_json("/api/orders", {
+        "text": "https://example.com/a.mp4",
+        "quality": "720",
+        "watermark": "delogo",
+    })
+    assert data["ok"]
+    order = store.get(data["order"]["id"])
+    assert order.meta.get("quality") == "720"
+    assert order.meta.get("watermark") == "delogo"
+
+    # 空值不写进 meta（否则会覆盖掉配置默认）
+    other = api.post_json("/api/orders", {"text": "https://example.com/b.mp4",
+                                          "quality": "", "watermark": ""})
+    assert store.get(other["order"]["id"]).meta.get("quality") is None
+
+
 def test_create_order_and_wait_for_done(console, store, sample_server):
     api, _, _ = console
     data = api.post_json("/api/orders", {

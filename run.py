@@ -275,6 +275,62 @@ def cmd_resolve(args) -> int:
     return 0
 
 
+def cmd_delogo(args) -> int:
+    """给已下载的文件擦水印（ffmpeg delogo）。
+
+    **有损**：用周边像素插值盖住水印区域，会留淡淡痕迹、局部画质下降。
+    所以默认**另存** `xxx.nowm.mp4`，要覆盖源文件必须显式 `--in-place`。
+    水印位置优先用 `--rect x:y:w:h`（准），其次按 `--platform` 预设（估），
+    两者都没有就直接报错 —— 盖错地方比不盖更糟。
+    """
+    from xydl import watermark
+
+    config = Config.load(args.config).apply_env_overrides()
+    ffmpeg = Downloader(config).ytdlp.find_ffmpeg()
+    if not ffmpeg:
+        print("❌ 没找到 ffmpeg（打包版自带；源码运行请先装 ffmpeg）")
+        return 2
+
+    source = Path(args.path)
+    if not source.is_file():
+        print(f"❌ 找不到文件：{source}")
+        return 2
+    platform = args.platform or watermark.guess_platform(str(source))
+    out = source if args.in_place else (Path(args.out) if args.out else None)
+
+    width, height = watermark.probe_size(ffmpeg, source)
+    print(f"源文件    {source}")
+    print(f"分辨率    {width}x{height}" if width
+          else "分辨率    （读不到 → 只能用 --rect 手动指定）")
+    if platform:
+        print(f"平台预设  {platform} —— {watermark.preset_label(platform)}")
+    print(f"处理方式  {'擦水印后覆盖源文件' if args.in_place else '另存为 .nowm 文件'}")
+
+    # 先 dry-run 把矩形算出来给人看：这一步最能避免"盖错地方"
+    ok, _target, message = watermark.delogo_file(
+        ffmpeg, source,
+        platform="" if args.rect else platform, rect=args.rect, out=out, dry_run=True)
+    if not ok:
+        print(f"❌ {message}")
+        return 2
+    print(f"滤镜      {message}")
+    if args.dry_run:
+        print("（--dry-run：没有真的转码）")
+        return 0
+
+    print("\n转码中…")
+    ok, target, message = watermark.delogo_file(
+        ffmpeg, source,
+        platform="" if args.rect else platform, rect=args.rect, out=out)
+    if not ok:
+        print(f"❌ {message}")
+        return 1
+    print(f"✅ {message}")
+    print(f"   产物    {target}")
+    print("   提示    delogo 是插值覆盖：矩形越准效果越好，可用 --rect 微调后重跑")
+    return 0
+
+
 def cmd_download(args) -> int:
     from xydl import series as series_mod
 
@@ -283,6 +339,10 @@ def cmd_download(args) -> int:
         config.set("download.series.enabled", False)
     if getattr(args, "range", ""):
         config.set("download.series.episode_range", args.range)
+    if getattr(args, "quality", ""):
+        config.set("download.quality", args.quality)
+    if getattr(args, "watermark", ""):
+        config.set("download.watermark", args.watermark)
     downloader = Downloader(config)
     outdir = Path(args.out) if args.out else config.path_of("download_dir") / "cli"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -324,7 +384,8 @@ def cmd_download(args) -> int:
 
     started = time.time()
     result = downloader.download(target_url, job_dir_for(outdir, "cli"), kind=kind,
-                                 title_hint=target_title, progress=on_progress)
+                                 title_hint=target_title, progress=on_progress,
+                                 quality=getattr(args, "quality", "") or None)
     print()
     if result.ok:
         print(f"✅ 成功  {result.file_path}")
@@ -1792,9 +1853,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--single", action="store_true",
                    help="只下这一集，不做多剧集展开")
     p.add_argument("--range", default="", help="只下指定集，如 1-10,15")
+    p.add_argument("--quality", default="", choices=["", "best", "1080", "720", "480", "360"],
+                   help="清晰度：best 不限 / 1080 / 720 / 480 / 360（本站点没有的档会自动降级）")
+    p.add_argument("--watermark", default="",
+                   choices=["", "auto", "off", "delogo", "any"],
+                   help="水印处理：auto 优先无水印（默认）/ off 只要无水印 / "
+                        "delogo 用 ffmpeg 擦掉（有损）/ any 不挑")
     p.add_argument("--mode", default="", choices=["", "zip", "separate"],
                    help="多剧集交付方式：zip 打包 / separate 多个文件")
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("delogo",
+                       help="给已下载的文件擦水印（ffmpeg delogo，有损；只处理成片）")
+    p.add_argument("path", help="要处理的视频文件")
+    p.add_argument("--platform", default="",
+                   help="按平台预设定位水印（douyin/tiktok/kuaishou/wechat_channels/"
+                        "xiaohongshu），水印都在右下角")
+    p.add_argument("--rect", default="",
+                   help="手动指定水印区域 x:y:w:h（比预设准；推荐先用 --dry-run 看）")
+    p.add_argument("-o", "--out", help="输出文件（默认是源文件同目录的 xxx.nowm.mp4）")
+    p.add_argument("--in-place", action="store_true",
+                   help="直接替换源文件（默认另存，避免有损处理后无法回退）")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只打印将要用的 delogo 矩形与滤镜，不真的转码")
+    p.set_defaults(func=cmd_delogo)
 
     p = sub.add_parser("series", help="看一条链接会下几集（不下载）")
     p.add_argument("url")

@@ -165,6 +165,21 @@
       <input id="sender" placeholder="标签（可选）" style="max-width:132px">
     </div>
     <div class="row">
+      <label class="hint" style="align-self:center;min-width:52px">清晰度</label>
+      <select id="quality" style="max-width:190px">
+        <option value="">跟随配置（默认 best）</option>
+        <option value="best">best（站点最高）</option>
+        <option value="1080">1080P</option>
+        <option value="720">720P</option>
+        <option value="480">480P</option>
+        <option value="360">360P</option>
+      </select>
+      <label class="hint" style="align-self:center;min-width:52px">水印</label>
+      <select id="watermark" style="max-width:230px">
+        <option value="">跟随配置（默认 优先无水印）</option>
+      </select>
+    </div>
+    <div class="row">
       <button id="submit" class="wide" onclick="submitOrder()">开始下载</button>
       <button class="ghost" onclick="document.getElementById('text').value=''">清空</button>
     </div>
@@ -173,6 +188,9 @@
       <br><b>B站</b> 分P / 合集 / 番剧 / UP主投稿会自动识别成多集，打包成 zip 交付。
       <br><b>微信视频号</b>：粘 <code>weixin.qq.com/sph/…</code> 短链后，工具会引导你去
       <b>腾讯元宝</b>解析一次，把解析出的链接粘回来即可下载（不需要登录、不需要抓包）。
+      <br><b>清晰度</b>按本单生效；站点没有该档位会自动降级。
+      <br><b>水印</b>默认「优先无水印源」：拿不到干净源时如实标注「带水印源」；
+      <br>要「擦掉画面里的水印」选 delogo（用 ffmpeg 插值覆盖，<b>有损</b>，水印区会留痕迹）。
       <br>没带链接时会用标题去 <b>Google / DuckDuckGo</b> 自动找源。
       <br>受版权保护的平台（腾讯视频、爱奇艺等）会自动识别并提示。
       <br><span class="kbd"><code>Ctrl</code> + <code>Enter</code></span> 快速开始
@@ -365,6 +383,8 @@ async function submitPicked(){
       body: JSON.stringify({
         text,
         episode_range: picked,
+        quality: document.getElementById('quality').value,
+        watermark: document.getElementById('watermark').value,
         conversation_id: document.getElementById('conversation').value.trim(),
         sender: document.getElementById('sender').value.trim(),
       })
@@ -436,6 +456,8 @@ async function submitOrder(){
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         text,
+        quality: document.getElementById('quality').value,
+        watermark: document.getElementById('watermark').value,
         conversation_id: document.getElementById('conversation').value.trim(),
         sender: document.getElementById('sender').value.trim(),
       })
@@ -495,6 +517,31 @@ async function revealDir(){
   }catch(e){ toast(e.message, true); }
 }
 
+// 清晰度 / 水印处理的下拉选项由**后端**给（/api/state 的
+// qualities / watermark_modes），前端不写死 —— 命令行和界面共用同一套取值，
+// 以后加档位只改一处。只在第一次填充，避免每 2 秒刷新时把用户的选择重置掉。
+let selectsFilled = false;
+function fillSelects(d){
+  if(selectsFilled) return;
+  const wm = document.getElementById('watermark');
+  if(wm && Array.isArray(d.watermark_modes) && d.watermark_modes.length){
+    const keep = wm.value;
+    wm.innerHTML = '<option value="">跟随配置（默认 优先无水印）</option>'
+      + d.watermark_modes.map(m =>
+          `<option value="${esc(m.value)}">${esc(m.value)} — ${esc(m.label)}</option>`
+        ).join('');
+    wm.value = keep;
+  }
+  const q = document.getElementById('quality');
+  if(q && Array.isArray(d.qualities) && d.qualities.length){
+    const keep = q.value;
+    q.innerHTML = '<option value="">跟随配置（默认 best）</option>'
+      + d.qualities.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+    q.value = keep;
+  }
+  selectsFilled = true;
+}
+
 async function refresh(){
   if(busy) return;
   busy = true;
@@ -502,6 +549,7 @@ async function refresh(){
     const r = await fetch(apiUrl('/api/state'));
     const d = await r.json();
     if(!d.ok) throw new Error(d.error || '');
+    fillSelects(d);
     renderChips(d);
     renderOrders(d.orders || []);
   }catch(e){

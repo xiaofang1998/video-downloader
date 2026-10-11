@@ -83,6 +83,14 @@ DEFAULTS: dict[str, Any] = {
         # （抖音的 `playwm` 与 `play` 就是同一份视频的两个地址），开启后按无水印优先。
         # 只有带水印版本时会在交付信息里如实标注"带水印源"，不会静默交付。
         "prefer_no_watermark": True,
+        # 水印处理策略（下单时可按订单覆盖）：
+        #   auto   —— 优先无水印源；只有带水印版本时如实标注（默认）
+        #   off    —— 只要无水印源；拿不到就报错（宁可不交也不交带水印的）
+        #   delogo —— 优先无水印源；只有带水印版本时用 ffmpeg 擦掉（有损）
+        #   any    —— 不挑，拿到哪个算哪个
+        "watermark": "auto",
+        # delogo 的自动矩形（"x:y:w:h"）。留空则按平台预设的比例估算。
+        "delogo_rect": "",
         # 传给 yt-dlp 的额外参数，按需自行追加
         "ytdlp_extra_args": [],
         # 例如 "chrome" / "edge"，从浏览器读 cookie；留空则不用。

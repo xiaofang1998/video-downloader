@@ -215,10 +215,18 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, body, "text/html; charset=utf-8")
 
     def _api_state(self) -> None:
+        from .. import watermark as watermark_mod
+
         payload = self.pipeline.snapshot()
         payload["ok"] = True
         payload["channels"] = self.server.channels_desc  # type: ignore[attr-defined]
         payload["orders"] = [o.to_dict() for o in self.pipeline.store.list_orders(limit=50)]
+        # 下拉选项由后端给，前端不写死：命令行/WebUI 用同一套取值
+        payload["qualities"] = ["best", "1080", "720", "480", "360"]
+        payload["watermark_modes"] = [
+            {"value": key, "label": label}
+            for key, label in watermark_mod.WATERMARK_MODES.items()
+        ]
         self._json(200, payload)
 
     def _api_orders(self, query: dict[str, list[str]]) -> None:
@@ -290,6 +298,12 @@ class _Handler(BaseHTTPRequestHandler):
         picked = str(data.get("episode_range") or "").strip()
         if picked:
             meta["episode_range"] = picked
+        # 界面上的「清晰度 / 水印处理」选择。同样只放 meta、只对这一单生效 ——
+        # 改全局配置会让并发订单互相串。
+        for key in ("quality", "watermark"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                meta[key] = value
         order, created = self.pipeline.submit_text(
             text=text,
             conversation_id=str(data.get("conversation_id") or "").strip() or "console",

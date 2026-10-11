@@ -14,7 +14,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from . import linkparse
 from . import series as series_mod
@@ -373,6 +373,7 @@ class Pipeline:
         result = self.downloader.download(
             chosen_url, job_dir, kind=chosen.kind, title_hint=title,
             progress=on_progress, cancel=cancel,
+            **self._download_options(order_id),
         )
 
         if cancel.is_set():
@@ -531,7 +532,8 @@ class Pipeline:
                     self._emit(fresh, self.replies.progress(fresh, p.percent, p.eta))
 
             result = self._download_episode(episode, episode_dir, plan,
-                                            progress=on_progress, cancel=cancel)
+                                            progress=on_progress, cancel=cancel,
+                                            order_id=order_id)
             if cancel.is_set():
                 self._finish_cancelled(order_id)
                 return
@@ -623,16 +625,18 @@ class Pipeline:
     def _download_episode(self, episode: "series_mod.Episode", episode_dir: Path,
                           plan: "series_mod.SeriesPlan",
                           progress: Callable[[Progress], None],
-                          cancel: threading.Event) -> DownloadResult:
+                          cancel: threading.Event,
+                          order_id: int = 0) -> DownloadResult:
         """下一集。视频号走它自己的解析链（按 object_id / export_id 定位）。"""
         hint = episode.hint(plan.title)
+        options = self._download_options(order_id) if order_id else {}
         if episode.source == "wechat_channels" and not episode.url:
             return self.downloader.download_channels_episode(
                 episode.object_id, episode.export_id, episode_dir,
                 title_hint=hint, progress=progress, cancel=cancel)
         return self.downloader.download(
             episode.url, episode_dir, kind="page", title_hint=hint,
-            progress=progress, cancel=cancel)
+            progress=progress, cancel=cancel, **options)
 
     @staticmethod
     def _clean_series_dir(episodes_dir: Path) -> None:
@@ -736,7 +740,25 @@ class Pipeline:
         self.store.update(order_id, chosen_url=new.url)
         return self.downloader.download(new.url, job_dir, kind=new.kind,
                                         title_hint=title, progress=progress,
-                                        cancel=cancel)
+                                        cancel=cancel,
+                                        **self._download_options(order_id))
+
+    def _download_options(self, order_id: int) -> dict[str, Any]:
+        """按**订单**里的选择生成下载选项（清晰度 / 水印处理）。
+
+        走订单 meta 而不是改全局配置：并发订单各选各的，改全局会让 A 单的选择
+        串到 B 单上（选集那个 bug 就是这么来的）。下单接口把这两个字段放进 meta。
+        """
+        order = self.store.get(order_id)
+        meta = order.meta if (order is not None and isinstance(order.meta, dict)) else {}
+        options: dict[str, Any] = {}
+        quality = str(meta.get("quality") or "").strip()
+        if quality:
+            options["quality"] = quality
+        watermark = str(meta.get("watermark") or "").strip()
+        if watermark:
+            options["watermark"] = watermark
+        return options
 
     def _finish_cancelled(self, order_id: int) -> None:
         self.store.update(order_id, status=OrderStatus.CANCELLED.value,
