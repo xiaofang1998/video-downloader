@@ -5,7 +5,11 @@
     uv run run.py once "<买家消息>"    # 同步处理一条，打印全过程
     uv run run.py parse "<买家消息>"   # 只看链接识别结果（不联网）
     uv run run.py resolve <url>      # 只做短链展开 / 落源
-    uv run run.py download <url>     # 只下载
+    uv run run.py download <url>     # 只下载（B站/视频号多剧集会自动展开）
+    uv run run.py series <url>       # 看这条链接会下几集（不下载）
+    uv run run.py wxinfo <url>       # 看视频号链接能解析到什么（不下载）
+    uv run run.py decrypt <文件> -k <decode_key>   # 解密本地抓下来的视频号文件
+    uv run run.py channels-login     # 登录视频号助手（诊断用；实测不能下视频号视频）
     uv run run.py login douyin       # 登录抖音并配好 cookie（下不了抖音时用）
     uv run run.py cookies            # 查看浏览器里有没有目标站点的 cookie
     uv run run.py baidu-login        # 授权百度网盘（交付用：发链接而不是发文件）
@@ -40,7 +44,7 @@ from xydl.pipeline import Pipeline                             # noqa: E402
 from xydl.resolver import Resolver                             # noqa: E402
 from xydl.search import build_router                           # noqa: E402
 from xydl.store import Store                                   # noqa: E402
-from xydl.utils import now_str, snippet                        # noqa: E402
+from xydl.utils import now_str, sanitize_filename, snippet   # noqa: E402
 
 BANNER = r"""
    ___  _  _  ___  _
@@ -272,7 +276,13 @@ def cmd_resolve(args) -> int:
 
 
 def cmd_download(args) -> int:
+    from xydl import series as series_mod
+
     config = Config.load(args.config).apply_env_overrides()
+    if getattr(args, "single", False):
+        config.set("download.series.enabled", False)
+    if getattr(args, "range", ""):
+        config.set("download.series.episode_range", args.range)
     downloader = Downloader(config)
     outdir = Path(args.out) if args.out else config.path_of("download_dir") / "cli"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -281,6 +291,27 @@ def cmd_download(args) -> int:
 
     print(f"引擎：{' / '.join(downloader.available_engines())}")
     print(f"输出：{outdir}\n")
+
+    # 先看是不是多剧集 —— 接单场景里"以为一集、结果 80 集"是真实事故
+    plan = series_mod.plan(args.url, config=config, engine=downloader.ytdlp,
+                           title_hint=args.title)
+    if plan.error:
+        print(f"❌ 合集配置有误，已停止：{plan.error}")
+        return 2
+    single_ep = plan.episodes[0] if plan.episodes else None
+    if plan.is_series or (plan.expands_series and single_ep is not None
+                          and not single_ep.url):
+        print(f"识别为多剧集：{plan.describe()}\n")
+        return _download_series_cli(downloader, plan, outdir, args, config)
+
+    # 展开后只选中 1 集：要下的是**那一集**，不是原始合集链接
+    # （合集链接带 --no-playlist 会下成第 1 集）
+    target_url = args.url
+    target_title = args.title
+    if plan.expands_series and single_ep is not None and single_ep.url:
+        target_url = single_ep.url
+        target_title = args.title or single_ep.title
+        print(f"合集里只选中 1 集，实际下载：{snippet(target_url, 90)}\n")
 
     last = [-1.0]
 
@@ -292,8 +323,8 @@ def cmd_download(args) -> int:
                   f"{speed}  ETA {p.eta}", flush=True)
 
     started = time.time()
-    result = downloader.download(args.url, job_dir_for(outdir, "cli"), kind=kind,
-                                 title_hint=args.title, progress=on_progress)
+    result = downloader.download(target_url, job_dir_for(outdir, "cli"), kind=kind,
+                                 title_hint=target_title, progress=on_progress)
     print()
     if result.ok:
         print(f"✅ 成功  {result.file_path}")
@@ -304,6 +335,83 @@ def cmd_download(args) -> int:
         return 0
     print(f"❌ 失败  {result.error}")
     return 1
+
+
+def _download_series_cli(downloader: Downloader, plan, outdir: Path, args,
+                         config: Config) -> int:
+    """CLI 下的多剧集下载：逐集下到 标题/ 目录，最后按需打包。
+
+    配置统一从传进来的 ``config`` 读（而不是重新 ``Config.load``）—— 后者会丢掉
+    ``--range`` 这类命令行覆盖，导致 ``--mode`` 与 ``--range`` 行为不一致。
+    """
+    from xydl import series as series_mod
+
+    safe_title = sanitize_filename(plan.title or "合集", maxlen=60) or "合集"
+    target_dir = outdir / safe_title
+    target_dir.mkdir(parents=True, exist_ok=True)
+    total = plan.count
+    files: list[Path] = []
+    failures: list[str] = []
+
+    for position, episode in enumerate(plan.episodes, 1):
+        print(f"\n【{position}/{total}】{snippet(episode.title or episode.url, 70)}")
+        episode_dir = target_dir / f".tmp-{position:02d}"
+
+        def on_progress(p, _pos=position):
+            print(f"  [{_pos}/{total}][{p.stage}] {p.percent:5.1f}%  "
+                  f"{human_size(p.downloaded)}", flush=True)
+
+        if episode.source == "wechat_channels" and not episode.url:
+            result = downloader.download_channels_episode(
+                episode.object_id, episode.export_id, episode_dir,
+                title_hint=episode.hint(plan.title), progress=on_progress)
+        else:
+            result = downloader.download(episode.url, episode_dir, kind="page",
+                                         title_hint=episode.hint(plan.title),
+                                         progress=on_progress)
+        if not result.ok:
+            failures.append(f"第{position}集：{result.error}")
+            print(f"  ❌ {result.error}")
+            continue
+
+        source = Path(result.file_path)
+        episode_title = (series_mod.clean_episode_title(episode.title, plan.title)
+                         or series_mod.clean_episode_title(result.title, plan.title)
+                         or f"第{position}集")
+        # 用原始集号命名（range=9,10 时要落成 09/10，而不是 01/02）
+        number = episode.index if episode.index and episode.index > 0 else position
+        dest = target_dir / series_mod.episode_filename(
+            number, episode_title, source.suffix or ".mp4")
+        try:
+            source.replace(dest)
+        except OSError:
+            dest = source
+        files.append(dest)
+        print(f"  ✅ {dest.name}  {human_size(dest.stat().st_size)}")
+        # 清掉这一集的临时目录（产物已经搬走了）
+        try:
+            episode_dir.rmdir()
+        except OSError:
+            pass
+
+    print()
+    if not files:
+        print(f"❌ 全部失败：{'；'.join(failures[:3])}")
+        return 1
+
+    mode = (str(args.mode or "").strip().lower()
+            or str(config.get("download.series.mode", "zip") or "zip").lower())
+    if mode == "zip" and len(files) > 1:
+        archive_path, error = series_mod.archive(files, outdir / f"{safe_title}.zip")
+        if archive_path:
+            print(f"📦 已打包  {archive_path}")
+        else:
+            print(f"⚠ 打包失败（{error}），文件都在 {target_dir}")
+
+    print(f"✅ 完成 {len(files)}/{total} 集"
+          + (f"；失败 {len(failures)} 集：{'；'.join(failures[:2])}" if failures else ""))
+    print(f"   目录 {target_dir}")
+    return 0 if not failures else 1
 
 
 def cmd_login(args) -> int:
@@ -574,7 +682,10 @@ _EXTRACTOR_KEYS: dict[str, str] = {
     "twitch": "twitch",
     "haokan": "haokan",
     "pipixia": "ippzone",
-    "wechat": "weixin",
+    # 视频号：yt-dlp 没有任何 weixin/channels/finder 提取器（实测确认），
+    # 走我们自研的解析链；公众号同理，正文视频基本是腾讯源。
+    "wechat_channels": "weixin",
+    "wechat_mp": "weixin",
     "tencent_video": "vqq",
     "iqiyi": "iqiyi",
     "youku": "youku",
@@ -607,8 +718,14 @@ MEASURED_BREAK_WITH_COOKIE: frozenset[str] = frozenset(
 #: 实测**带不带都行**的平台
 MEASURED_EITHER_WAY: frozenset[str] = frozenset({"douyin", "xiaohongshu", "bilibili"})
 
-#: yt-dlp 没有解析器、由我们自研 GraphQL 兜底的平台
-SELF_RESOLVED: frozenset[str] = frozenset({"kuaishou"})
+#: yt-dlp 没有解析器、由自研逻辑兜底的平台
+SELF_RESOLVED: frozenset[str] = frozenset({"kuaishou", "wechat_channels"})
+
+#: 自研兜底平台的说明（列表里显示给运营看）
+SELF_RESOLVED_NOTES: dict[str, str] = {
+    "kuaishou": "自研 GraphQL 解析（快手反爬严，可能被滑块拦截）",
+    "wechat_channels": "自研解析：匿名拿标题/封面；mp4 需 TikHub key 或扫码登录",
+}
 
 
 def cmd_platforms(args) -> int:
@@ -651,7 +768,7 @@ def cmd_platforms(args) -> int:
             ok.append(rule.label)
             if rule.key in SELF_RESOLVED:
                 cookie = "不带"
-                mark, note = "✅", "自研 GraphQL 解析（快手反爬严，可能被滑块拦截）"
+                mark, note = "✅", SELF_RESOLVED_NOTES.get(rule.key, "自研解析")
             elif rule.key in MEASURED_BREAK_WITH_COOKIE:
                 cookie = "不带"
                 mark, note = "✅", "实测带了 cookie 反而被风控拒绝"
@@ -679,6 +796,22 @@ def cmd_platforms(args) -> int:
     print("   · 西瓜视频必须配 —— 不带 cookie 会下不了")
     print("   · YouTube 千万不能带 —— 带了会被风控拒绝，反而下不了")
     print("   配法：start.bat login douyin")
+    print()
+    print("  关于多剧集：")
+    print("   · B站 的分P / 合集 / 番剧 / UP主投稿 会自动展开成 N 集，打包成 zip 交付")
+    print("     想只下几集：config.json 里设 download.series.episode_range = \"1-10\"")
+    print("     上限：download.series.max_episodes（默认 50）")
+    print("   · 视频号要靠 TikHub 才能列出剧集，否则只下当前这一集")
+    print("     先看一遍会下什么：run.py series <链接>")
+    print()
+    print("  关于视频号（重点）：")
+    print("   · 匿名只能拿到标题/封面；**mp4 目前只有一条实测可用的路**：")
+    print("     delivery.tikhub.api_key —— 一次返回直链 + decode_key")
+    print("   · 「扫码登录网页版再用浏览器抓」实测无效（2026-10）：预览页只渲染")
+    print("     封面图 + 二维码，网页版 feed 页匿名返回 10012、登录了也拿不到媒体请求。")
+    print("     run.py channels-login 只作为诊断入口保留，默认不参与下载。")
+    print("   · 视频号下发的前 128KB 是 ISAAC64 加密的，本项目会自动解密")
+    print("     单独验一条：run.py wxinfo <分享链接>")
     print()
     print("  升级 yt-dlp（解析器失效时用）：")
     print("     .venv\\Scripts\\python.exe -m pip install -U yt-dlp")
@@ -864,6 +997,438 @@ def cmd_bridge_ping(args) -> int:
     return 1
 
 
+def cmd_wxinfo(args) -> int:
+    """只看视频号链接能解析到什么（不下载）。
+
+    视频号的解析链有好几级，失败原因也很不一样（没配 key / 没登录 / 内容不可播），
+    所以给一条命令把**每一级的结果**都摊开，省得在流水线日志里猜。
+    """
+    from xydl import wechat_channels as wc
+    from xydl.cdp_fetch import login_profile_dir
+
+    config = Config.load(args.config).apply_env_overrides()
+    print(BANNER.format(version=__version__))
+
+    url = args.url.strip()
+    if not wc.is_channels_url(url):
+        print(f"  ✗ 这不是视频号链接：{snippet(url, 80)}")
+        print("    支持：https://weixin.qq.com/sph/<码>")
+        print("          https://channels.weixin.qq.com/finder-preview/pages/sph?id=<码>")
+        print("          https://channels.weixin.qq.com/web/pages/feed?eid=<exportId>")
+        return 2
+
+    ref = wc.parse_ref(url)
+    print(f"  短码        {ref.short_uri or '（无）'}")
+    print(f"  exportId    {ref.export_id or '（无）'}")
+    print(f"  TikHub 用    {ref.channel_id or '（无短码，只能走 exportId/objectId）'}")
+
+    print("\n① 匿名预览接口（不需要登录）")
+    feed = wc.fetch_feed_info(ref, config)
+    if feed.ok:
+        print(f"  ✓ 标题：{feed.title or '（无）'}")
+        print(f"    作者：{feed.author or '（无）'}    点赞：{feed.like_count or '-'}")
+        print(f"    封面：{snippet(feed.cover_url, 70)}")
+        print(f"    exportId：{feed.export_id}")
+        if feed.error:
+            print(f"    ⚠ {feed.error}")
+    else:
+        print(f"  ✗ {feed.error}")
+
+    key = str(config.get("delivery.tikhub.api_key", "") or "").strip()
+    print("\n② TikHub 直链解析")
+    if not key:
+        print("  ✗ 未配置 delivery.tikhub.api_key")
+        print("\n②b 本地抓包（不依赖 TikHub）")
+        from xydl import mitm as _mitm
+        from xydl import wxproxy as _wxproxy
+
+        store = _wxproxy.CaptureStore(path=_wxproxy.capture_store_path(config))
+        print(f"  证书        {'已装' if _mitm.ca_installed() else '未装 → run.py channels-capture'}")
+        print(f"  已抓条目    {len(store.entries())} 条")
+        local = wc.resolve_media(url, config, feed=feed, allow_browser=False)
+        if local.ok:
+            print(f"  ✓ 直链：{snippet(local.url, 90)}")
+            print(f"    decode_key：{local.decode_key or '（无）'}   来源：{local.via}")
+            # 可选档位都列出来 —— 用户要的是"分辨率可选"，那就得先能看见有什么
+            if local.feed is not None and local.feed.raw:
+                cands = wc.feed_media_candidates(local.feed.raw.get("feedInfo") or {})
+                if cands:
+                    print("    可选档位    " + "、".join(
+                        c["label"] + (f"({c['height']}p)" if c["height"] else "")
+                        for c in cands))
+                    if local.quality:
+                        print(f"    实际选中    {local.quality}"
+                              f"（偏好 {config.get('download.quality') or 'compatible'}）")
+        else:
+            for attempt in local.attempts:
+                print(f"  · {attempt}")
+            if local.error:
+                # 这句才是运营真正需要的操作指引（短链要换成"复制链接"那种）
+                print(f"  → {snippet(local.error, 300)}")
+    else:
+        media = wc.resolve_media(url, config, feed=feed, allow_browser=False)
+        if media.ok:
+            print(f"  ✓ 直链：{snippet(media.url, 90)}")
+            print(f"    decode_key：{media.decode_key or '（无，可能不需要解密）'}")
+            print(f"    体积：{human_size(media.file_size) if media.file_size else '未知'}")
+        else:
+            for attempt in media.attempts:
+                print(f"  ✗ {attempt}")
+
+    profile = login_profile_dir("wechat_channels")
+    print("\n③ 登录态浏览器抓取")
+    print(f"  profile 目录  {profile}")
+    if getattr(args, "no_browser", False):
+        print("  （--no-browser：跳过实际抓取，只看 profile）")
+    elif not bool(config.get("download.wechat_channels.use_browser", False)):
+        print("  （已跳过：download.wechat_channels.use_browser 默认关 —— "
+              "实测浏览器抓取对视频号无效）")
+    else:
+        # 真的去抓一次 —— 这一步才是"通道 ③ 能不能用"的唯一硬证据。
+        # 只报 profile 状态是自欺欺人：cookie 库存在 ≠ 能抓到直链。
+        wait = float(config.get("download.wechat_channels.browser_wait_sec", 25) or 25)
+        ref2 = wc.parse_ref(url)
+        if feed.export_id:
+            ref2 = wc.ChannelsRef(short_uri=ref2.short_uri, export_id=feed.export_id,
+                                  object_id=ref2.object_id, original_url=url)
+        print(f"  正在打开登录态浏览器抓取（最多 {wait:.0f} 秒）…")
+        capture = wc.capture_via_browser(
+            ref2, config, wait_sec=wait, log=lambda m: print(f"    · {m}"))
+        if capture.video_url:
+            print(f"  ✓ 抓到直链：{snippet(capture.video_url, 96)}")
+            print(f"    decode_key：{capture.decode_key or '（无，可能不需要解密）'}")
+            print("    → 通道 ③ 可用，直接 `run.py download <链接>` 即可")
+        else:
+            print(f"  ✗ {capture.error}")
+            print("    → 通道 ③ 不可用，请配 delivery.tikhub.api_key（通道 ②）")
+        print(f"  观察到的相关请求 {len(capture.visited)} 个"
+              + ("：" if capture.visited else ""))
+        for u in capture.visited[:6]:
+            print(f"    - {snippet(u, 100)}")
+
+    print("\n④ 解密能力自检（离线）")
+    from xydl import wxdecrypt
+
+    ok_ks = wxdecrypt.generate_keystream("2136343393", 16).hex()
+    mp4_head = wxdecrypt.looks_like_media(b"\x00\x00\x00\x20ftypisom")
+    print(f"  密钥流样例    {ok_ks}")
+    print(f"  MP4 头识别    {'✓ 正常' if mp4_head else '✗ 异常'}")
+    print("  自动解密      "
+          f"{'开' if config.get('download.wechat_channels.auto_decrypt', True) else '关（不推荐）'}")
+    return 0 if feed.ok else 1
+
+
+def cmd_channels_login(args) -> int:
+    """登录视频号助手 / 腾讯元宝，把登录态存进工具自管的 Edge profile。
+
+    ``--yuanbao`` 是**视频号下载的入口**：元宝能把 ``/sph/xxx`` 短链解析成带 token 的
+    ``playable_url``，那是唯一能拿到明文 MP4 的路线。元宝的鉴权在页面上下文里
+    （cookie 里只有分析类），所以必须在页内 fetch（见 :mod:`xydl.yuanbao`），
+    也就必须有一个登录过元宝的浏览器 profile。
+    """
+    from xydl import wechat_channels as wc
+    from xydl.cdp_fetch import login_profile_dir
+
+    config = Config.load(args.config).apply_env_overrides()
+    if getattr(args, "yuanbao", False):
+        # 视频号下载的入口：元宝能把 /sph/xxx 短链换成带 token 的 playable_url
+        from xydl import yuanbao
+
+        print(BANNER.format(version=__version__))
+        print("  登录目标      腾讯元宝（视频号短链解析入口）")
+        print("  说明          用工具自管的 Edge profile，和你日常浏览器完全隔离")
+        print("  为什么要登录  元宝的鉴权在页面上下文里（cookie 里只有分析类），"
+              "必须在页内 fetch")
+        if args.check:
+            ok, msg = yuanbao.check_login()
+            print(("  ✅ " if ok else "  ✗ ") + msg)
+            return 0 if ok else 1
+        ok, msg = yuanbao.login(log=lambda m: print(f"  · {m}"),
+                                wait_sec=float(args.wait))
+        print(("  ✅ " if ok else "  ✗ ") + msg)
+        return 0 if ok else 1
+
+    profile = login_profile_dir("wechat_channels")
+    print(BANNER.format(version=__version__))
+    print(f"  登录态目录   {profile}")
+    print("  说明         用的是工具自管的 Edge profile，和你日常浏览器完全隔离")
+    # 顺手把"另一条通道"的状态说清楚：配了 TikHub 的话，其实不一定非要登录
+    if str(config.get("delivery.tikhub.api_key", "") or "").strip():
+        print("  提示         TikHub key 已配置 —— 那条通道不需要登录，"
+              "这里只是给「没有 key」或「TikHub 失败」时兜底")
+    else:
+        print("  提示         未配置 delivery.tikhub.api_key，所以登录这条通道是必需的")
+
+    if args.check:
+        hits = [p for p in profile.rglob("Cookies") if p.is_file()]
+        if not hits:
+            print("\n  ✗ 还没有登录过 → 跑 `run.py channels-login`")
+            return 1
+        size = sum(p.stat().st_size for p in hits)
+        print(f"\n  ✓ 找到 {len(hits)} 个 cookie 库（共 {human_size(size)}）")
+        print("    真正是否有效，跑 `run.py wxinfo <分享链接>` 看第 ③ 步")
+        return 0
+
+    if args.open:
+        url = args.url or wc.WEB_HOME_PAGE
+        import webbrowser
+        print(f"\n  用默认浏览器打开（**不带工具 profile**，仅用于看清登录入口）：{url}")
+        try:
+            webbrowser.open(url)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  打不开浏览器：{exc}")
+        return 0
+
+    print("\n" + "─" * 64)
+    print(f"  1. 马上会弹出一个 Edge 窗口，打开 {wc.WEB_HOME_PAGE}")
+    print("  2. 用**手机微信扫码**登录（登录的是你自己的微信号，凭据只留在本机）")
+    print("  3. 登录成功后页面会进到视频号助手；看到就说明成了")
+    print("  4. 关掉窗口后回来，本命令会自己结束")
+    print("─" * 64 + "\n")
+
+    from xydl.cdp_fetch import login
+
+    login("wechat_channels", args.url or wc.WEB_HOME_PAGE,
+          wait_sec=float(args.wait))
+    print(f"\n  ✓ 登录流程结束，登录态在 {profile}")
+    print("    验证：run.py wxinfo <视频号分享链接>")
+    return 0
+
+
+def cmd_series(args) -> int:
+    """看一眼「这条链接会下几集」，不下载。
+
+    接单前先跑它，能避免两种事故：把 UP 主的 800 个投稿全下了、
+    或者以为是一集结果客户要的是整部剧。
+    """
+    from xydl import series as series_mod
+
+    config = Config.load(args.config).apply_env_overrides()
+    if args.max_episodes:
+        config.set("download.series.max_episodes", int(args.max_episodes))
+    if args.range:
+        config.set("download.series.episode_range", args.range)
+
+    print(BANNER.format(version=__version__))
+    downloader = Downloader(config)
+    url = args.url.strip()
+    print(f"  链接         {url}")
+    print(f"  多剧集展开   {'开' if config.get('download.series.enabled', True) else '关'}")
+    print(f"  上限/区间    {config.get('download.series.max_episodes')} 集"
+          f"  range={config.get('download.series.episode_range')!r}")
+    print()
+
+    plan = series_mod.plan(url, config=config, engine=downloader.ytdlp,
+                           title_hint=args.title or "")
+    # 配置层面的错误必须**明确报出来**。之前这里把 plan.error 吞了，
+    # 结果"上限 2 + 指定第 5 集"会显示成"单集：<合集页URL>"，看着像正常结论。
+    if plan.error:
+        print("  结论         ✗ 配置有误，已停止")
+        print(f"  原因         {plan.error}")
+        return 2
+    print(f"  结论         {plan.describe()}")
+    if plan.note:
+        print(f"  备注         {plan.note}")
+    print()
+    for episode in plan.episodes:
+        label = episode.title or "（标题待下载时探测）"
+        target = episode.url or f"object_id={episode.object_id}"
+        print(f"  {episode.index:>3}. [{episode.source}] {snippet(label, 40)}")
+        print(f"       {snippet(target, 96)}")
+    if plan.truncated:
+        print("\n  ⚠ 已达 download.series.max_episodes 上限，实际集数可能更多")
+    return 0 if plan.episodes else 1
+
+
+def cmd_channels_capture(args) -> int:
+    """视频号本地抓包服务：选择性 MITM + 链式上游代理 + 系统代理可还原。
+
+    用户视角应该是"静默"的：装当前用户证书（不需要管理员）、起代理、把系统代理
+    指过来（原有 Clash 之类的代理作为上游保留），**退出时全部还原**。
+
+    唯一需要人做的事：在**电脑端微信**里把那个视频播一下 —— 这是视频号的设计
+    决定的（浏览器/网页版拿不到媒体流），任何本地方案都一样。
+    """
+    import signal
+
+    from xydl import mitm, wxproxy
+
+    config = Config.load(args.config).apply_env_overrides()
+
+    if args.uninstall:
+        ok, msg = mitm.uninstall_ca()
+        print(("✅ " if ok else "❌ ") + msg)
+        return 0 if ok else 1
+
+    # 上次被强杀可能把系统代理留在这儿（finally 跑不到）。启动先自检并还原，
+    # 否则用户的状态是"一跑这工具就没网"，而且他没法自己判断原因。
+    state_file = config.path_of("data_dir") / "proxy_state.json"
+    leftover = mitm.SystemProxy(state_file)
+    if mitm.SystemProxy.leaked(int(args.port)):
+        print(f"  ⚠ 检测到系统代理还指着 127.0.0.1:{args.port}（上次异常退出）")
+        print(f"  {leftover.restore()}")
+        if args.restore:
+            return 0
+
+    if args.restore:
+        print(f"  {leftover.restore()}")
+        return 0
+
+    root = config.path_of("data_dir") / "ca"
+    ca = mitm.CertAuthority(root)
+    ok, msg = ca.ensure()
+    print(f"  证书目录   {root}")
+    print(f"  {('✅' if ok else '❌')} {msg}")
+    if not ok:
+        return 1
+
+    installed = mitm.ca_installed()
+    if args.status:
+        print(f"  证书已装    {'是' if installed else '否'}")
+        print(f"  {mitm.SystemProxy().describe()}")
+        store = wxproxy.CaptureStore(path=wxproxy.capture_store_path(config))
+        entries = store.entries()
+        print(f"  已抓到的视频 {len(entries)} 条"
+              + (f"（最近：{entries[-1].get('title') or entries[-1]['url'][:50]}）"
+                 if entries else ""))
+        return 0
+
+    if not installed:
+        if args.no_install_ca:
+            print("  ⚠ 没有装证书（--no-install-ca）：目标域名抓不到内容，只能透传")
+        else:
+            ok, msg = mitm.install_ca(ca.ca_crt)
+            print(f"  {('✅' if ok else '❌')} {msg}")
+            if not ok:
+                return 1
+
+    upstream = str(args.upstream or "").strip()
+    if not upstream:
+        # 用户原本的系统代理（Clash 之类）留作上游：非目标流量照旧走它
+        current = mitm.SystemProxy()._read()
+        candidate = current.server.split(";")[0].strip()
+        if candidate and "127.0.0.1:" + str(args.port) not in candidate:
+            upstream = candidate
+    if upstream and not upstream.startswith("http"):
+        upstream = "http://" + upstream
+
+    store = wxproxy.CaptureStore(path=wxproxy.capture_store_path(config))
+    proxy = wxproxy.ChannelsProxy(
+        store, host="127.0.0.1", port=int(args.port), ca=ca,
+        upstream=upstream, log=lambda m: print(f"  · {m}", flush=True))
+    proxy.start()
+    if not mitm.wait_for_port("127.0.0.1", proxy.port):
+        print("  ❌ 代理端口没起来")
+        return 1
+
+    sysproxy = mitm.SystemProxy(state_file)
+    if args.no_system_proxy:
+        print(f"  （--no-system-proxy：请自行把 *.qq.com 的流量转到 "
+              f"127.0.0.1:{proxy.port}，例如 Clash 的 Global Extend Script）")
+    else:
+        sysproxy.snapshot()
+        sysproxy.set_to("127.0.0.1", proxy.port)
+        print(f"  ✅ 系统代理已指向 127.0.0.1:{proxy.port}"
+              + (f"（上游 {upstream}）" if upstream else ""))
+
+    print()
+    print("=" * 66)
+    # 必须显式说清注入开没开：它会把代码塞进页面自己的 JS bundle，
+    # 虽然是最小侵入（只包一个页面 API、不碰 CSP/HTML/全局），也不该默认开。
+    print(f"  页面注入    {'开（只在视频号页面生效）' if proxy.inject else '关'}"
+          + ("" if proxy.inject else "   —— 需要它就设 XYDL_CAPTURE_INJECT=1"))
+    # 日志**同时写文件**：stdout 被刷屏时会丢关键行（实测：注入回报的行被埋掉，
+    # 排查时只能看到"新增 0 条"这种没有信息量的行）。写文件后可以直接搜。
+    try:
+        log_path = ROOT / "data" / "capture_log.txt"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(log_path, "a", encoding="utf-8")
+        original_log = proxy.log
+
+        def tee(message: str) -> None:
+            try:
+                handle.write(message + "\n")
+                handle.flush()
+            except OSError:
+                pass
+            original_log(message)
+
+        proxy.log = tee  # type: ignore[method-assign]
+        print(f"  日志文件    {log_path}")
+    except OSError as exc:
+        print(f"  （日志文件没建起来：{exc}，只打屏）")
+    print("  现在去**电脑端微信**里打开那个视频号视频并播放一下。")
+    print("  抓到之后，`run.py download <视频号分享链接>` 就会自动用它。")
+    print("  按 Ctrl+C 结束（会先还原系统代理）。")
+    print("=" * 66)
+
+    stopping = threading.Event()
+    started_at = time.time()
+
+    def _stop(signum, frame):                 # noqa: ARG001
+        stopping.set()
+
+    try:
+        signal.signal(signal.SIGINT, _stop)
+    except (ValueError, OSError):
+        pass
+    try:
+        while not stopping.is_set():
+            time.sleep(0.5)
+            if args.once and store.latest():
+                print("  ✓ 已经抓到带密钥的结果，退出")
+                break
+            if args.timeout and time.time() - started_at > args.timeout:
+                print("  到时间了，退出")
+                break
+    finally:
+        proxy.stop()
+        if not args.no_system_proxy:
+            print(f"  {sysproxy.restore()}")
+    print(f"  本次统计：{proxy.stats}")
+    return 0
+
+
+def cmd_decrypt(args) -> int:
+    """解密视频号加密视频（本地文件，就地解密）。
+
+    为什么需要这条命令：本地抓包工具（wx_channels_download / mitmproxy / 各种
+    "视频号下载器"）拿到的文件，**前 128 KiB 是 ISAAC64 加密的** —— 直接播放是
+    花屏，也不该直接交给客户。把文件和解密密钥喂给这条命令就能变成正常 MP4。
+
+    只在校验通过时才覆盖原文件（box 链自洽），解错就原样保留并报错。
+    """
+    from xydl import wxdecrypt
+
+    path = Path(args.path)
+    if not path.exists():
+        print(f"❌ 文件不存在：{path}")
+        return 2
+    size = path.stat().st_size
+    print(f"  文件   {path}")
+    print(f"  大小   {human_size(size)}")
+
+    if not wxdecrypt.needs_decrypt(path):
+        print("  ✓ 这个文件**不需要解密**（文件头已经是正常的 MP4/媒体）")
+        return 0
+
+    key = str(args.decode_key or "").strip()
+    if not key:
+        print("  ✗ 这个文件看起来是视频号加密格式，但没给密钥")
+        print("    需要该直链**同一次响应**里的 decode_key（每次请求都会变），例如：")
+        print(f"      run.py decrypt \"{path}\" --decode-key 2136343393")
+        return 2
+
+    ok, message = wxdecrypt.decrypt_file(path, key)
+    if not ok:
+        print(f"  ❌ 解密失败：{message}")
+        print("    常见原因：decode_key 与这个文件不是同一次请求配对（key 每次都会变）")
+        return 1
+    print(f"  ✅ 解密成功：{message}")
+    print(f"  现在可以正常播放/交付：{path}")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     """环境自检：出问题时第一件该跑的事。"""
     from xydl.http import parse_proxy_spec, system_proxy_url
@@ -961,6 +1526,34 @@ def cmd_doctor(args) -> int:
             extra = f"  → {config.get('delivery.bridge.upstream_url')}"
         print(f"  {'✓' if enabled else '✗'} {name}{extra if enabled else ''}")
 
+    print("\n[微信视频号]")
+    from xydl.cdp_fetch import login_profile_dir
+
+    print("  平台支持     解析链：匿名元数据 → TikHub 直链 → 登录态浏览器抓取")
+    key = str(config.get("delivery.tikhub.api_key", "") or "").strip()
+    if key:
+        print("  ① TikHub     ✓ 已配置 api_key（推荐通道：直链 + decode_key 一起来）")
+    else:
+        print("  ① TikHub     ✗ 未配置 delivery.tikhub.api_key")
+        print("                 → 不配的话只能拿到标题/封面，拿不到 mp4")
+    # 用和 channels-login / 抓取完全同一个函数算路径 —— 三处各写一套的话，
+    # 打包成 exe 后 ROOT 与 app_dir() 不一致，doctor 会误报"没登录过"
+    profile = login_profile_dir("wechat_channels")
+    logged = any(p.is_file() for p in profile.rglob("Cookies")) if profile.exists() else False
+    print(f"  ② 浏览器登录  {'✓ 已有登录态' if logged else '✗ 没登录过 → run.py channels-login'}")
+    print(f"                 profile: {profile}")
+    print(f"  ③ 自动解密    "
+          f"{'✓ 开（视频号前 128KB 必须解密）' if config.get('download.wechat_channels.auto_decrypt', True) else '✗ 关（会交付打不开的文件）'}")
+    from xydl import wxdecrypt
+
+    sample = wxdecrypt.generate_keystream(wxdecrypt.SELFTEST_DECODE_KEY, 8).hex()
+    print(f"     解密引擎   黄金向量自检 {sample}（应等于 "
+          f"{wxdecrypt.SELFTEST_KEYSTREAM16_HEX[:16]}）")
+    if sample != wxdecrypt.SELFTEST_KEYSTREAM16_HEX[:16]:
+        print("                 ✗ 与真实样本不符 —— 解密算法被改坏了，先修它再下视频号")
+    if not key and not logged:
+        print("  ⚠ 两条通道都没通 —— 视频号这单只能下到标题，下不到画面")
+
     # 交付通道：闲鱼发不了视频文件，这一步决定了「怎么把视频交给买家」
     print("\n[交付（网盘 / 对象存储）]")
     from xydl.uploaders import build_uploader
@@ -1023,7 +1616,7 @@ def cmd_selftest(args) -> int:
             failures.append(name)
 
     # ── 1. 链接识别 ────────────────────────────────────────────────
-    print("\n[1/5] 链接识别")
+    print("\n[1/6] 链接识别")
     cases = [
         ("7.92 复制打开抖音 https://v.douyin.com/iRNBho6/",
          "douyin", "short", "这个视频太搞笑了"),
@@ -1031,6 +1624,9 @@ def cmd_selftest(args) -> int:
         ("https://www.bilibili.com/video/BV1xx411c7mD",
          "bilibili", "page", ""),
         ("https://v.qq.com/x/cover/abc.html", "tencent_video", "drm", ""),
+        # 视频号：/sph/ 短链必须被认成"需要展开的短链"，展开后落到 channels 域名
+        ("https://weixin.qq.com/sph/AJizVCRhAt",
+         "wechat_channels", "short", ""),
         ("就这个视频，猫咪打呼噜合集", None, None, "猫咪打呼噜合集"),
     ]
     for text, platform, kind, title in cases:
@@ -1046,7 +1642,7 @@ def cmd_selftest(args) -> int:
                   f"→ {top.platform}/{top.kind} conf={top.confidence}" if top else "→ 无")
 
     # ── 2. 本地 HTTP 下载 ─────────────────────────────────────────
-    print("\n[2/5] 直链下载（本地 HTTP 服务器）")
+    print("\n[2/6] 直链下载（本地 HTTP 服务器）")
     serve_root = Path(tempfile.mkdtemp(prefix="xydl-serve-"))
     payload = bytes(range(256)) * 8192          # 2 MiB 可校验内容
     (serve_root / "sample.mp4").write_bytes(payload)
@@ -1092,7 +1688,7 @@ def cmd_selftest(args) -> int:
         httpd.server_close()
 
     # ── 3. 回话模板 ────────────────────────────────────────────────
-    print("\n[3/5] 回话模板")
+    print("\n[3/6] 回话模板")
     from xydl.models import Order
     from xydl.replies import Replies
 
@@ -1106,7 +1702,7 @@ def cmd_selftest(args) -> int:
     check("模板缺字段不抛异常", isinstance(broken, str))
 
     # ── 4. 存储层 ─────────────────────────────────────────────────
-    print("\n[4/5] 订单存储")
+    print("\n[4/6] 订单存储")
     tmpdb = Path(tempfile.mkdtemp(prefix="xydl-db-")) / "t.sqlite3"
     store = Store(tmpdb)
     try:
@@ -1133,8 +1729,36 @@ def cmd_selftest(args) -> int:
     finally:
         store.close()
 
-    # ── 5. 短链展开（需要外网）─────────────────────────────────────
-    print("\n[5/5] 短链展开（需要外网，失败不算致命）")
+    # ── 5. 视频号解析 + 解密（离线）──────────────────────────────────
+    print("\n[5/6] 视频号解析 / 解密（离线）")
+    from xydl import wechat_channels as wc
+    from xydl import wxdecrypt
+    from xydl import series as series_mod
+
+    ref = wc.parse_ref("https://weixin.qq.com/sph/AJizVCRhAt")
+    check("分享短码解析", ref.short_uri == "AJizVCRhAt" and ref.channel_id == "sphAJizVCRhAt",
+          f"→ {ref.short_uri}")
+    check("预览页识别", wc.is_channels_url(
+        "https://channels.weixin.qq.com/finder-preview/pages/sph?id=x")
+        and not wc.is_channels_url("https://mp.weixin.qq.com/s/abc"))
+    check("剧集编号识别",
+          wc.series_episode_number("出狱后，我举世无双-第1集") == 1
+          and wc.series_prefix("某某短剧 EP3") == "某某短剧")
+
+    # 解密用真实样本的黄金向量（前 16 字节密钥流），能立刻发现算法被改坏
+    golden = wxdecrypt.generate_keystream(
+        wxdecrypt.SELFTEST_DECODE_KEY, 16).hex()
+    check("视频号解密引擎", golden == wxdecrypt.SELFTEST_KEYSTREAM16_HEX, golden)
+    check("MP4 头识别",
+          wxdecrypt.looks_like_media(b"\x00\x00\x00\x20ftypisom")
+          and not wxdecrypt.looks_like_media(b"\x23\x76\x6a\x16"))
+
+    check("多剧集区间解析", series_mod.parse_range("1-3,5", 10) == [1, 2, 3, 5])
+    plan = series_mod.plan("https://www.douyin.com/video/1", config=config)
+    check("非多剧集链接不误判", not plan.is_series)
+
+    # ── 6. 短链展开（需要外网）─────────────────────────────────────
+    print("\n[6/6] 短链展开（需要外网，失败不算致命）")
     resolver = Resolver(config)
     expanded = resolver.expand("https://b23.tv/BV1GJ411x7h7")
     ok = expanded.status == 200 and "bilibili.com" in expanded.final_url
@@ -1186,7 +1810,59 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("url")
     p.add_argument("-o", "--out", help="输出目录")
     p.add_argument("-t", "--title", default="", help="文件名提示")
+    p.add_argument("--single", action="store_true",
+                   help="只下这一集，不做多剧集展开")
+    p.add_argument("--range", default="", help="只下指定集，如 1-10,15")
+    p.add_argument("--mode", default="", choices=["", "zip", "separate"],
+                   help="多剧集交付方式：zip 打包 / separate 多个文件")
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("series", help="看一条链接会下几集（不下载）")
+    p.add_argument("url")
+    p.add_argument("-t", "--title", default="", help="标题提示")
+    p.add_argument("-n", "--max-episodes", type=int, default=0,
+                   help="临时改上限（不写回配置）")
+    p.add_argument("-r", "--range", default="", help="临时改集数区间，如 1-10")
+    p.set_defaults(func=cmd_series)
+
+    p = sub.add_parser("wxinfo", help="看视频号链接能解析到什么（不下载）")
+    p.add_argument("url", help="视频号分享链接")
+    p.add_argument("--no-browser", action="store_true",
+                   help="跳过第 ③ 步的登录态浏览器抓取（不弹窗、更快）")
+    p.set_defaults(func=cmd_wxinfo)
+
+    p = sub.add_parser("channels-login",
+                       help="登录元宝（视频号解析入口）/ 视频号助手")
+    p.add_argument("--yuanbao", action="store_true",
+                   help="登录腾讯元宝（视频号短链解析的入口，只需一次）")
+    p.add_argument("--check", action="store_true", help="只检查登录态，不启动浏览器")
+    p.add_argument("--open", action="store_true", help="用默认浏览器打开登录页（不写登录态）")
+    p.add_argument("--url", default="", help="改用这个地址登录")
+    p.add_argument("--wait", type=float, default=180, help="等登录的秒数（默认 180）")
+    p.set_defaults(func=cmd_channels_login)
+
+    p = sub.add_parser("channels-capture",
+                       help="视频号本地抓包服务（选择性 MITM；微信 PC 里播一次即可）")
+    p.add_argument("--port", type=int, default=2023, help="本地代理端口（默认 2023）")
+    p.add_argument("--upstream", default="",
+                   help="链式上游代理；留空自动沿用你当前系统代理")
+    p.add_argument("--status", action="store_true", help="只看状态（证书/代理/已抓条目）")
+    p.add_argument("--uninstall", action="store_true", help="卸载证书后退出")
+    p.add_argument("--no-system-proxy", action="store_true",
+                   help="不改系统代理（自行把 qq.com 流量转到这里）")
+    p.add_argument("--restore", action="store_true",
+                   help="只把系统代理还原成上次记录的值（被强杀后救网用）")
+    p.add_argument("--no-install-ca", action="store_true", help="不装证书（只透传）")
+    p.add_argument("--once", action="store_true", help="抓到带密钥的结果就退出")
+    p.add_argument("--timeout", type=float, default=0, help="最多跑多少秒")
+    p.set_defaults(func=cmd_channels_capture)
+
+    p = sub.add_parser("decrypt",
+                       help="解密视频号加密视频（本地文件；本地抓包工具抓下来的那种）")
+    p.add_argument("path", help="要解密的文件")
+    p.add_argument("-k", "--decode-key", default="",
+                   help="该直链同一次响应里的 decode_key（十进制字符串）")
+    p.set_defaults(func=cmd_decrypt)
 
     p = sub.add_parser("doctor", help="环境自检")
     p.set_defaults(func=cmd_doctor)

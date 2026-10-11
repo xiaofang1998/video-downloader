@@ -43,6 +43,48 @@ def test_broken_template_does_not_raise(config: Config):
     assert Replies(config).done(make_order())      # 不抛异常即通过
 
 
+# ── 多剧集话术：失败集绝不能被隐藏 ────────────────────────────────────
+def test_series_done_shows_total_not_just_successes(config: Config):
+    """买 50 集只下到 50 集时，话术要写"共 50 集"（不是只写成功数）。"""
+    text = Replies(config).series_done(make_order(), count=50, total=50, failed=0)
+    assert "共 50 集" in text
+    assert "全部成功" in text
+
+
+def test_series_partial_is_used_when_some_episodes_fail(config: Config):
+    """买 50 集只下到 5 集 → 话术必须把 45 集失败说出来。"""
+    text = Replies(config).series_done(make_order(), count=5, total=50, failed=45)
+    assert "共 50 集" in text, "总集数要写出来"
+    assert "45" in text and "没下成功" in text, "失败集数必须可见"
+    assert "全部成功" not in text, "不能给买家'全部成功'的印象"
+
+
+def test_series_partial_warning_survives_template_deletion(config: Config):
+    """运营把 series_partial 清空，也不能让失败信息消失。"""
+    config.set("replies.series_partial", "")
+    text = Replies(config).series_done(make_order(), count=5, total=50, failed=45)
+    assert "45" in text and "没下成功" in text
+
+
+def test_series_done_appends_truncated_note(config: Config):
+    text = Replies(config).series_done(make_order(), count=50, total=50,
+                                       note="（本次只下了前 50 集，是单次上限）")
+    assert "单次上限" in text
+
+
+def test_series_truncated_note_is_configurable(config: Config):
+    replies = Replies(config)
+    assert "50" in replies.series_truncated_note(50)
+    config.set("replies.series_truncated_note", "")
+    assert replies.series_truncated_note(50) == ""
+
+
+def test_series_done_falls_back_to_done_template(config: Config):
+    config.set("replies.series_done", "")
+    text = Replies(config).series_done(make_order(), count=2, total=2)
+    assert "猫咪打呼噜合集.mp4" in text, "没有合集话术时应退回普通交付话术"
+
+
 def test_empty_template_returns_empty(config: Config):
     config.set("replies.done", "")
     assert Replies(config).done(make_order()) == ""

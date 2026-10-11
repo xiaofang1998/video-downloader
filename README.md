@@ -14,9 +14,11 @@
 | 能力 | 说明 |
 | --- | --- |
 | **链接识别** | 从一段中文 + emoji 里精确切出 URL，识别 30+ 平台，自动区分短链 / 完整页 / 直链 / 受保护平台 |
-| **短链展开** | `v.douyin.com` / `b23.tv` / `xhslink.cn` / `v.kuaishou.com` / `t.cn` / `youtu.be` … 跟随重定向直到落地地址 |
+| **短链展开** | `v.douyin.com` / `b23.tv` / `xhslink.cn` / `v.kuaishou.com` / `t.cn` / `youtu.be` / `weixin.qq.com/sph/…` … 跟随重定向直到落地地址 |
 | **标题落源** | 只发了一句标题、没发链接时，自动拿标题去 Google / DuckDuckGo 找原视频 |
 | **无水印下载** | 抖音 / TikTok / 快手走 TikHub 第三方解析（拿无水印直链），其余平台走 yt-dlp |
+| **多剧集 / 合集** | B站 分P / 合集 / 番剧 / UP主投稿 一条链接自动展开成 N 集，按 `01 02 03` 编号下载并打包成 zip；视频号短剧可走 TikHub 拉全剧 |
+| **微信视频号** | `weixin.qq.com/sph/…` 分享链接可直接识别；标题/作者/封面匿名可取，mp4 走 TikHub 或扫码登录；内置 ISAAC64 解密（前 128KB） |
 | **多画质** | best / 1080 / 720 / 480 可选，B站 / YouTube 自动合流（内置 ffmpeg） |
 | **直链下载** | 拿到 `...mp4` 直链也能直接下 |
 | **受保护平台识别** | 腾讯视频 / 爱奇艺 / 优酷 / 芒果TV 会被识别为 DRM，不做无意义的尝试 |
@@ -40,14 +42,16 @@ start.bat platforms
 | TikTok | ✅ 走 TikHub 第三方解析 | 同上 |
 | 快手 | ✅ 走 TikHub 第三方解析 | 同上 |
 | 小红书 | ✅ | 带不带 cookie 都行 |
-| 哔哩哔哩 | ✅（含 `b23.tv` 短链） | 带不带 cookie 都行 |
+| 哔哩哔哩 | ✅（含 `b23.tv` 短链·多剧集） | 带不带 cookie 都行；分P/合集/番剧/UP主投稿自动展开 |
+| 微信视频号 | ⚠️ 自研解析（匿名拿元数据） | mp4 需 TikHub key 或扫码登录网页版，见下文专章 |
 | YouTube | ✅ | 千万别给它带 cookie |
 | 直链 `.mp4` | ✅ 直接下载 | — |
 | 微博 | ⚠️ 需登录态 | 样本链接易失效 |
 | 西瓜视频 | ⚠️ 解析器上游失效 | 等 yt-dlp 修复 |
 | X / Instagram / Facebook / Vimeo / Twitch | ✅ | yt-dlp 有解析器 |
 | 腾讯视频 / 爱奇艺 / 优酷 / 芒果TV | ⛔ 按设计拦截（DRM） | — |
-| 好看视频 / 皮皮虾 / 微信视频号 | ❌ yt-dlp 无解析器 | 拿直链可下 |
+| 好看视频 / 皮皮虾 | ❌ yt-dlp 无解析器 | 拿直链可下 |
+| 微信公众号文章 | ❌ 不做 | 正文视频基本是腾讯源（DRM） |
 
 ---
 
@@ -64,7 +68,10 @@ start.bat platforms
 
 ```bat
 start.bat serve                                     :: 启动服务（默认）
-start.bat download https://www.bilibili.com/video/BVxxx   :: 只下一条
+start.bat download https://www.bilibili.com/video/BVxxx   :: 只下一条（多剧集自动展开）
+start.bat series https://space.bilibili.com/xxx/video     :: 先看会下几集（不下载）
+start.bat wxinfo https://weixin.qq.com/sph/xxxxx     :: 看视频号能解析到什么
+start.bat channels-login                            :: 登录视频号助手（诊断用；实测不能下视频号视频）
 start.bat parse "7.92 复制打开抖音 https://v.douyin.com/xxx/"  :: 只看链接识别
 start.bat resolve https://b23.tv/xxx                :: 只做短链展开
 start.bat cdp-login douyin                          :: 登录抖音（登录态兜底）
@@ -77,8 +84,8 @@ start.bat selftest                                  :: 离线自测
 
 启动成功后打开 <http://127.0.0.1:8765/>。
 
-> 💡 下载**抖音 / TikTok / 快手**需要 TikHub key 或登录态，见下一节；
-> B站 / YouTube / 小红书等开箱即用。
+> 💡 下载**抖音 / TikTok / 快手 / 微信视频号**需要 TikHub key 或登录态，见下一节；
+> B站（含多剧集）/ YouTube / 小红书等开箱即用。
 
 ---
 
@@ -130,6 +137,309 @@ Chrome / Edge 127+ 启用了 **App-Bound 加密**（v20），yt-dlp 解不开，
 
 ---
 
+## 多剧集下载（B站 / 视频号）
+
+一条链接对应一整部剧时，工具会自动展开成 N 集，**逐集编号下载**，默认打包成一个
+zip 交付（客户拿到一堆同名 mp4 是排不出顺序的）。
+
+### B站：一条链接通吃所有形态
+
+| 链接形态 | 例子 | 结果 |
+| --- | --- | --- |
+| 多分P | `bilibili.com/video/BV1xx?p=1` | 每个分P 一集 |
+| 合集 / 系列 | `space.bilibili.com/<mid>/channel/collectiondetail?sid=…` | 合集内全部视频 |
+| UP主投稿 | `space.bilibili.com/<mid>/video` | 该 UP 的投稿（受上限约束） |
+| 番剧 | `bilibili.com/bangumi/play/ss…` | 按集展开 |
+| 列表 / 收藏夹 | `bilibili.com/list/…` | 列表内全部 |
+
+实现上只用 yt-dlp 的 `--flat-playlist -J`（**只取条目清单，不逐集解析详情**），
+所以一个 50 集的合集探测只要一次请求；每集真正的标题在下载时由 yt-dlp 自己探测。
+
+### 视频号：TikHub 才能列全剧
+
+视频号没有公开的匿名列表接口，所以：
+
+- 配了 `delivery.tikhub.api_key`：`短码 → finder username → 合集列表 → 合集内视频`；
+  合集对不上时退到「该账号作品列表 + 标题前缀匹配」（`出狱后，我举世无双-第1集`
+  能识别出剧名 `出狱后，我举世无双`）。
+- 没配：只下当前这一集，并在日志里说明原因（不假装成功）。
+
+### 控制范围
+
+```jsonc
+"download": {
+  "series": {
+    "enabled": true,        // 关掉就回到「一次一条链接」的老行为
+    "max_episodes": 50,     // 误把 800 个投稿全下了是真实事故，所以有上限
+    "episode_range": "",    // 只下指定集，如 "1-10,15"
+    "mode": "zip"           // zip 打包交付 | separate 保留多个文件
+  }
+}
+```
+
+接单前先看一眼会下多少集，避免"以为一集、结果整部剧"：
+
+```bat
+start.bat series https://space.bilibili.com/946974/video -n 10   :: 看前 10 集会下什么（不下载）
+start.bat download "https://www.bilibili.com/video/BVxxx" --range 1-5   :: 只下 1~5 集
+start.bat download "https://www.bilibili.com/video/BVxxx" --single      :: 只下当前这集
+```
+
+### 全部下载 vs 指定剧集
+
+**两种都支持**，靠 `episode_range` 切换：
+
+| 想要的 | 怎么做 | 结果 |
+| --- | --- | --- |
+| **整部/整个合集** | `episode_range` 留空（默认） | 源里有多少集就下多少，最多 `max_episodes`（默认 50） |
+| **指定几集** | `--range "1-5,8,12"` 或 config 里写 `episode_range` | 只下这几集 |
+| **只要当前这一集** | `--single` | 完全不展开，按单集处理 |
+
+区间写法：`1-10,15`、`3`、`20-30`；逗号/中文逗号/空格/顿号都能当分隔符；
+越界的号（如只有 10 集却写 `99`）会被忽略；**整段都解析不出来时会直接报错停下**
+（订单转「需人工」），不会静默改成"全下"——运营写 `1-5` 的本意是省流量，
+悄悄变成下 50 集是**放大**损失。
+
+两个已修的坑，正好都是这两条路交界的：
+
+1. **指定超出上限的集数**：`max_episodes=2` + `--range 5` 以前会匹配不到、静默
+   退化成去下载合集页。现在会**按你点名的最大集号自动扩大探测窗口**（点第 5 集就取够 5 条）。
+2. **链接里带 `?p=N`**：这种链接 yt-dlp 只返回那一集。所以**写了区间时会去掉 `p`
+   去探测整部**（你要的是"这部剧的第几集"），没写区间则保持"只下这一集"。
+   实测：链接是 `?p=2`、`--range 1` → 日志明确写 `实际下载：…?p=1`，下到 39MB 的第 1 集，
+   而不是 207MB 的第 2 集。
+3. 指定区间后**不会再报**"已达单次上限"——你已经明确选了自己要的集。
+
+产物结构（两种模式下逐集文件都会留着，方便单独重发某一集）：
+
+```text
+downloads/<订单号>/
+├─ episodes/01 某某短剧-第1集.mp4
+├─ episodes/02 某某短剧-第2集.mp4
+└─ 某某短剧.zip                 ← zip 模式下交付给客户的是这个
+```
+
+> 部分集失败不影响其余集：订单仍算完成，失败集写进订单备注（控制台卡片上会显示
+> 「N/M 集 · 失败 K 集」），不会静默丢集。
+
+**交付话术**（都在 `config.json` 的 `replies` 段里，运营可改）：
+
+| 键 | 什么时候用 | 可用占位符 |
+| --- | --- | --- |
+| `series_done` | 全部成功 | `{title} {total} {count} {filename} {size}` |
+| `series_partial` | **有集失败时强制用** | 同上 + `{failed}` |
+| `series_truncated_note` | 被 `max_episodes` 截断时追加 | `{total}` |
+
+> `{count}` 是"成功几集"、`{total}` 是"总共几集"，**两者必须分开写**：
+> 买家按整部剧付钱，不能让他以为 50 集里下到的 5 集就是全部。
+> 就算把 `series_partial` 清空，工具也会在 `series_done` 后面追加一句不可移除的
+> 失败提示 —— 这条信息不允许被配置藏掉。
+
+---
+
+## 微信视频号（`/sph/xxx` 短链 / `/feed?token=…` 分享链接）
+
+视频号和别的平台有两点根本不同，值得单独说明。
+
+### 1. 分享链接不是内容页
+
+```text
+https://weixin.qq.com/sph/AJizVCRhAt
+  └─ 301 ─→ https://channels.weixin.qq.com/finder-preview/pages/sph?id=AJizVCRhAt
+              ↑ 一个 React 空壳页：正文只有 <div id="app">，没有 <video>，没有内嵌 JSON
+```
+
+**yt-dlp 完全没有视频号解析器**（实测确认：`wei|channel|finder|weixin` 一个都不存在），
+所以视频号走自研解析链：
+
+```text
+分享链接 → 短码/exportId
+   ├─ ① 匿名预览接口  POST /finder-preview/api/feed/get_feed_info   ← 不需登录
+   │      拿标题 / 作者 / 封面 / 点赞 / exportId（**拿不到 mp4**）
+   ├─ ② TikHub       POST /api/v1/wechat_channels/v2/fetch_video_detail
+   │      一次同时返回 直链 + decode_key   ← **目前唯一实测可用的路**
+   └─ ③ 登录态浏览器   CDP 打开 Edge 抓 finder.video.qq.com 的媒体请求
+          ⚠️ 实测无效，默认关闭（证据见下）
+```
+
+① 是唯一不需要登录的接口，所以**即使 mp4 拿不到，也能拿到标题和封面**
+（文件名、订单标题、回复话术都用得上）。
+
+```bat
+start.bat wxinfo https://weixin.qq.com/sph/AJizVCRhAt   :: 逐级打印解析结果，不下载
+```
+
+#### 为什么"扫码登录再用浏览器抓"走不通（2026-10 实测）
+
+这一条我一开始是打算当主力方案做的，**实测后被证伪**，所以默认关掉并写在这里，
+免得再有人走一遍冤枉路：
+
+| 试过的事 | 结果 |
+| --- | --- |
+| 扫码登录视频号助手（`channels.weixin.qq.com/platform`，已确认登录成功） | ✅ 登录态有效，控制台能看到账号 |
+| 用这个登录态打开**预览页** `finder-preview/pages/sph?id=…` | ❌ 整页 28 个请求里**没有任何视频请求**；页面仍只渲染**封面图 + 二维码**，写着"可扫码前往微信观看此内容" |
+| 用这个登录态打开**网页版** `web/pages/feed?eid=…` | ❌ 匿名请求返回 `{"errCode":10012 非法请求}`；带着登录态打开也拿不到 feed/媒体请求 |
+| 登录入口本身 | `/platform` 是**视频号助手（创作者后台）**，和消费者侧的网页播放不是同一套授权 |
+
+唯一在浏览器里能拿到的 `stodownload` 地址是**封面图**（路径 `/20350/`），
+视频在 `/20302/`。代码里用 `looks_like_video_url()` 把两者分开 —— 否则会把封面
+JPEG 当视频交付出去（这是"看起来成功"的那种事故）。
+
+> 顺带修掉的坑：一开始登录入口我写成了 `/web/pages/home`，实测那个地址匿名访问
+> 返回的是 **JSON** `{"errCode":10012}`，浏览器打开一片空白、根本没有二维码。
+> 正确的登录页是 `/platform`。
+
+所以视频号现在**只有 TikHub 一条路**。社区里流传的另一种做法是「本机微信 PC 客户端
++ 本地 mitm 代理抓包」，那需要装根证书、改系统代理、还要人工在客户端里点开视频，
+和一个无 GUI 的下载后端是两种形态，本项目不做。
+
+### 2. 下载到的文件前 128KB 是加密的
+
+视频号 CDN（`finder.video.qq.com/.../stodownload`）下发的是**被 ISAAC64 伪随机流
+XOR 过的 MP4**：只有前 131072 字节加密，其余是明文。直接交付 = 客户看到花屏 / 打不开。
+
+工具内置了完整解密（`xydl/wxdecrypt.py`）：
+
+- 种子 = `decode_key`（API 返回的十进制字符串），ISAAC64 初始化后按 `randrsl[255]→[0]`
+  取数、大端展开，XOR 前 128KB。
+- **解码正确性有黄金向量兜底**：公开样本 + `decode_key=2136343393` 解密后前 32 字节
+  必须是 `00000020 66747970 69736f6d…`（`ftyp isom`）。这条断言在单元测试和
+  `selftest` 里都有。
+- **安全策略**：只在解密结果通过 MP4 头校验时才覆盖原文件；校验不过就保留原文件并
+  报错 —— 宁可让人工介入，也绝不交付被二次 XOR 破坏的文件。
+
+`decode_key` 与直链**必须来自同一次 API 响应**（每次请求都会变），所以代码里两者
+是一次性配对返回、一起入库的。
+
+### 怎么用：粘链接就行（不需要 TikHub）
+
+在微信里对视频号视频点**"复制链接"**，得到的是这种形态：
+
+```
+https://channels.weixin.qq.com/finder-preview/pages/feed
+  ?comment_scene=39&token=XXXX&eid=export%2FUzFfBgAAxMOj…
+```
+
+把这条链接粘进工具，**直接就能下**（实测 11MB 视频 0.2 秒下完，明文 MP4，标题自动命名）：
+
+```bat
+start.bat download "https://channels.weixin.qq.com/finder-preview/pages/feed?token=…&eid=…"
+start.bat wxinfo  "https://channels.weixin.qq.com/finder-preview/pages/feed?token=…&eid=…"  :: 只看解析
+```
+
+**关键就在那个 `token`**：它会被放进请求体的 `baseReq.generalToken`。
+
+| `generalToken` 传什么 | 服务端返回 |
+| --- | --- |
+| **空字符串**（`weixin.qq.com/sph/xxx` 短链只能这样） | 只有标题/作者/封面/点赞 —— **媒体字段被剥离** |
+| **链接里的 token** | `feedInfo.videoUrl` + `h264VideoInfo` + `h265VideoInfo` —— **明文 MP4 直链** |
+
+所以：
+- **带 token 的分享链接** → 一条 HTTP 请求拿到直链，不需要 TikHub、不需要登录、不需要抓包、**也不需要解密**；
+- **只有 `/sph/xxx` 短链**（没有 token）→ 仍然只能拿元数据；这时才会去走 TikHub / 本地抓包。
+- 清晰度选 **h264**（`X-snsvideoflag=xWT113`）：页面播放器偏向 h265，但我们要交付给客户，
+  h265 在老手机/剪映上打不开，所以取兼容性更好的那条。
+
+> 这条路是把视频号前端 JS（`merlin.js` / `virtual_svg-icons-register.publish*.js`）挖出来、
+> 逐个接口实测才定位到的：`/web/api/*` 需要客户端内部上下文（`LoadCtx failed -2`）、
+> `/cgi-bin/micromsg-bin/*_findergetcommentdetail` 需要原生桥签名（`Cannot POST`），
+> 而 `finder-preview/api/feed/get_feed_info` 只要 token 就完整下发媒体。全是公开接口的正常调用，
+> 不抓包、不注入、不破解客户端。
+
+诊断用（不下载，逐级打印）：
+
+```bat
+start.bat wxinfo "https://channels.weixin.qq.com/finder-preview/pages/feed?token=…&eid=…"
+```
+
+### 2b. 兜底：TikHub 或本地抓包
+
+如果手上只有 `/sph/xxx` 短链、又必须拿到 mp4，还有两条兜底：
+
+```jsonc
+{ "delivery": { "tikhub": { "api_key": "你的key" } } }   // 一次返回直链 + decode_key
+```
+
+或本地抓包（见下一节），它需要让微信 PC 客户端播一次视频。
+
+> TikHub 那条返回的是**加密**文件（前 128KB ISAAC64），本项目会自动解密。
+> 带 token 的分享链接那条是**明文**，不需要解密 —— 两条路的产物都能直接交付。
+
+### 3. 兜底：内置本地抓包（`channels-capture`）
+
+只有在"拿不到 token 又不想用 TikHub"时才需要它：让微信 PC 客户端播这个视频，
+在本机把它的流量截下来。这条路已经做进项目自己，不用装第三方工具：
+
+```bat
+start.bat channels-capture              :: 起抓包服务（自动装当前用户证书 + 设系统代理）
+:: 然后去电脑端微信里把那个视频播一下
+start.bat channels-capture --status     :: 看证书/代理/已抓到几条
+start.bat channels-capture --uninstall  :: 卸载证书
+```
+
+抓到的结果落在 `data/wx_capture.json`，流水线会自动用它：
+
+```bat
+start.bat wxinfo https://weixin.qq.com/sph/xxxxx    :: ②b 会显示本地抓包通道的情况
+start.bat download https://weixin.qq.com/sph/xxxxx  :: 直接下（解密也是自动的）
+```
+
+#### 三条自我约束（都为了让"静默"不等于"乱来"）
+
+| 约束 | 具体做法 |
+| --- | --- |
+| **选择性中间人** | 只解密视频号相关域名（`channels.weixin.qq.com`、`finder.video.qq.com`、`wxapp.tc.qq.com`）；其余域名**字节级原样隧道转发**，不解密、不记录 |
+| **不装机器级证书** | 证书装进**当前用户**根证书库（`certutil -user`），**不需要管理员权限**，也不影响别的用户 |
+| **不留后遗症** | 改系统代理前先记录原值（你机器上是 `127.0.0.1:7897`，Clash），**原系统代理作为链式上游**保留，退出时还原；进程被杀也会在下次启动时自检残留 |
+
+> 证书是我们**自己签的**（openssl 或 `cryptography` 现生成，私钥只在你机器上），
+> 不像某些工具那样内置一份全世界共用的 CA 私钥 —— 那种 CA 私钥一旦公开，
+> 任何人都能冒充任意 HTTPS 网站。
+
+#### 如果微信不走系统代理
+
+有些环境里微信的视频号流量不理会系统代理。那就用 Clash（你本来就在跑）：
+
+```bat
+start.bat channels-capture --no-system-proxy
+```
+
+然后在 Clash 的 `Global Extend Script` 里把 `qq.com` 指过来（端口默认 `2023`）：
+
+```js
+function main(config) {
+  config["proxies"].unshift({ name: "xydl_capture", type: "http",
+                              server: "127.0.0.1", port: 2023 });
+  config["rules"].unshift("DOMAIN-SUFFIX,qq.com,xydl_capture");
+  return config;
+}
+```
+
+#### 还能直接用外部工具抓的结果
+
+同类工具（社区主流是 [ltaoo/wx_channels_download](https://github.com/ltaoo/wx_channels_download)，
+本机代理 `127.0.0.1:2023` + 机器级根证书 + 往页面注入下载按钮）抓到的**直链**同样能用：
+
+```bat
+:: 它已经把文件下下来了：就地解密（只解前 128KiB，解错会保留原文件）
+start.bat decrypt "D:\下载\某个视频号视频.mp4" --decode-key 2136343393
+
+:: 只有直链：直接丢给我们（没给 decode_key 会被明确拒收，不会交付花屏文件）
+start.bat download "https://finder.video.qq.com/251/20302/stodownload?encfilekey=..."
+```
+
+```text
+❌ 这是视频号加密文件（前 128KiB 被 ISAAC64 加密），直接交付会花屏/打不开。
+   需要该直链对应的 decode_key，然后跑：run.py decrypt "<文件>" --decode-key <key>
+```
+
+> 为什么不走"给微信内置浏览器开调试端口"那条更省事的路：本机实测微信 3.9 的
+> `WeChatAppEx.exe`（CEF 内核）被腾讯**裁掉了 `remote-debugging-port`**
+> （同文件里 `user-data-dir`/`no-sandbox` 都在，说明搜索没问题），所以那条路在
+> 这个版本上不存在。抓包是唯一可行的本地路线。
+
+---
+
 ## 配置说明（`config.json`）
 
 首次运行自动生成，注释写在默认值里。几个关键项：
@@ -142,7 +452,17 @@ Chrome / Edge 127+ 启用了 **App-Bound 加密**（v20），yt-dlp 解不开，
     "quality": "best",                 // best / 1080 / 720 / 480
     "prefer_compatible": true,         // 优先 H.264+AAC，保证发哪都能播
     "cookies_from_browser": "",        // 填 chrome/edge 可下需登录的内容
-    "ffmpeg_location": ""              // 留空自动查找
+    "ffmpeg_location": "",             // 留空自动查找
+    "series": {                        // 多剧集 / 合集（B站分P·合集·番剧·UP主投稿）
+      "enabled": true, "max_episodes": 50,
+      "episode_range": "", "mode": "zip"
+    },
+    "wechat_channels": {               // 微信视频号
+      "enabled": true,
+      "use_browser": false,            // 登录态浏览器抓取：**实测对视频号无效**，别开
+      "browser_wait_sec": 25,
+      "auto_decrypt": true             // 前 128KB ISAAC64 解密；关掉会交付打不开的文件
+    }
   },
   "search": {                          // 标题落源用的搜索引擎
     "serper_api_key": "",              // 推荐 https://serper.dev

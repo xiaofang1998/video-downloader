@@ -70,7 +70,14 @@ def _http_json(url: str) -> dict:
 
 
 class _CDP:
-    """最小 CDP 客户端：命令 + 事件流。"""
+    """最小 CDP 客户端：命令 + 事件流。
+
+    **事件不能被丢掉**：``call()`` 在等自己那条响应时，中间会夹杂大量
+    ``Network.*`` 事件。早期版本读到一个不是自己 id 的帧就直接扔了 —— 结果是
+    "先 ``Page.navigate`` 再开始监听"，导航期间的事件全被吃掉（实测：视频号抓包
+    里连文档请求都看不到，只剩一条无关的遥测请求）。现在把非匹配帧放进
+    ``self._events`` 缓冲，``wait_event`` 优先从这里取。
+    """
 
     def __init__(self, ws_url: str, timeout: float = 8.0):
         u = urlparse(ws_url)
@@ -83,6 +90,8 @@ class _CDP:
         while b"\r\n\r\n" not in resp:
             resp += self.sock.recv(4096)
         self._id = 0
+        #: 非本次 call() 响应的事件缓冲区（FIFO）
+        self._events: list[dict] = []
 
     def _send_frame(self, payload: str) -> None:
         data = payload.encode("utf-8")
@@ -127,8 +136,21 @@ class _CDP:
             data = json.loads(self._recv_frame().decode("utf-8", "replace"))
             if data.get("id") == mid:
                 return data
+            # 不是我们这次命令的响应 → 是事件。**必须缓存，不能丢**（见类注释）
+            if data.get("method"):
+                self._events.append(data)
+                if len(self._events) > 5000:      # 防御：别让缓冲无限涨
+                    del self._events[:1000]
 
     def wait_event(self, match, timeout: float = 20.0) -> dict | None:
+        """取下一个满足 ``match`` 的事件。
+
+        先看 ``call()`` 期间缓存的那些（否则"导航后开始监听"会漏掉导航请求），
+        缓存里没有才读 socket。
+        """
+        for idx, data in enumerate(self._events):
+            if match(data):
+                return self._events.pop(idx)
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.sock.settimeout(max(0.1, deadline - time.time()))
@@ -139,8 +161,12 @@ class _CDP:
             if not raw:
                 continue
             data = json.loads(raw.decode("utf-8", "replace"))
-            if data.get("method") and match(data):
-                return data
+            if data.get("method"):
+                if match(data):
+                    return data
+                self._events.append(data)
+                if len(self._events) > 5000:
+                    del self._events[:1000]
         return None
 
     def close(self) -> None:

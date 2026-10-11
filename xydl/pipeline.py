@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import linkparse
+from . import series as series_mod
 from .config import Config
 from .downloader import DownloadResult, Downloader, Progress, job_dir_for
 from .models import IncomingMessage, Order, OrderStatus
@@ -153,7 +154,19 @@ class Pipeline:
         return True
 
     def cancel(self, order_id: int) -> bool:
-        """取消订单：正在跑就置位取消标志，还没跑就直接改状态。"""
+        """取消订单：正在跑就置位取消标志，还没跑就直接改状态。
+
+        **必须先判订单状态、再看取消标志**。worker 收尾时是"先写终态、再回收标志"
+        （见 ``_run`` 的 finally），中间那一瞬间标志还在。反过来的顺序会把**已完成**
+        的订单报成"取消成功"——运营以为发出去的取消了，其实文件早就交付了。
+        这个顺序问题在整套测试里表现为偶发失败，抓到时一度以为是测试写错了。
+        """
+        order = self.store.get(order_id)
+        if order is None or OrderStatus(order.status).is_terminal:
+            with self._lock:
+                self._cancel_flags.pop(order_id, None)     # 顺手清掉残留标志
+            return False
+
         with self._lock:
             flag = self._cancel_flags.get(order_id)
         if flag is not None:
@@ -161,9 +174,6 @@ class Pipeline:
             self.store.log(order_id, "收到取消请求", level="warn")
             return True
 
-        order = self.store.get(order_id)
-        if order is None or OrderStatus(order.status).is_terminal:
-            return False
         self.store.update(order_id, status=OrderStatus.CANCELLED.value,
                           stage="已取消", error="任务已取消")
         self.store.log(order_id, "任务被取消", level="warn")
@@ -292,6 +302,42 @@ class Pipeline:
         self.store.log(order_id, f"下载源：{chosen.url}（{outcome.describe()}）")
 
         # ── 3. 下载 ────────────────────────────────────────────────
+        # 先判断这条链接是「一个视频」还是「一部剧/一个合集」。
+        # B站的分P/合集/番剧/UP主投稿都会被展开；视频号要靠 TikHub 才列得出来。
+        plan = self._plan_series(order_id, chosen, title)
+        if plan.error:
+            # 配置层面的错误（比如 episode_range 写得解析不出来）：宁可停下让人
+            # 来看，也不能"照旧把全部 50 集都下了" —— 那是在放大损失。
+            self.store.update(order_id, status=OrderStatus.NEED_MANUAL.value,
+                              stage="合集配置有误", error=plan.error)
+            self.store.log(order_id, f"多剧集配置有误，已停止：{plan.error}",
+                           level="error")
+            fresh = self.store.get(order_id)
+            if fresh:
+                self._emit(fresh, self.replies.need_manual(fresh, plan.error))
+            return
+        single_ep = plan.episodes[0] if plan.episodes else None
+        if plan.is_series or (plan.expands_series and single_ep is not None
+                              and not single_ep.url):
+            # 多集，或者"展开后只剩 1 集但那一集只能靠 id 定位"（视频号）：
+            # 都走逐集下载流程（1 集时不会打包，直接当单文件交付）。
+            self._run_series(order_id, plan, cancel)
+            return
+
+        # 展开后只选中 1 集时，要下的是**那一集**，不是买家发来的原始链接。
+        # 例：合集链接 + episode_range=5 → 必须下第 5 集；直接拿合集链接去下
+        # （命令里带 --no-playlist）会变成第 1 集 —— 下错了集还报成功。
+        chosen_url = chosen.url
+        if plan.expands_series and single_ep is not None and single_ep.url:
+            chosen_url = single_ep.url
+            if single_ep.title:
+                title = single_ep.title
+            self.store.update(order_id, chosen_url=chosen_url)
+            self.store.log(
+                order_id,
+                f"合集里只选中 1 集，实际下载：{snippet(chosen_url, 90)}",
+            )
+
         self.store.update(order_id, status=OrderStatus.DOWNLOADING.value,
                           stage="开始下载")
         job_dir = job_dir_for(self.download_dir, order_id)
@@ -325,7 +371,7 @@ class Pipeline:
                 self._emit(fresh, self.replies.progress(fresh, p.percent, p.eta))
 
         result = self.downloader.download(
-            chosen.url, job_dir, kind=chosen.kind, title_hint=title,
+            chosen_url, job_dir, kind=chosen.kind, title_hint=title,
             progress=on_progress, cancel=cancel,
         )
 
@@ -333,10 +379,12 @@ class Pipeline:
             self._finish_cancelled(order_id)
             return
 
-        if not result.ok:
+        if not result.ok and chosen_url == chosen.url:
             # 兜底重试：有些站点的分享短链域名我们没登记，平台认得出来、
             # 类型却判成了「普通页面」，于是没去展开 —— 拿短链直接下载必然失败。
             # 失败后补一次展开再试，代价只是一次请求。
+            # （已经换成"合集里那一集"的地址时不走这条：那条链接是展开出来的，
+            #   再拿原始链接去展开重试只会下错集。）
             retried = self._retry_after_expand(order_id, chosen, job_dir, title,
                                                on_progress, cancel)
             if retried is not None:
@@ -377,6 +425,263 @@ class Pipeline:
         fresh = self.store.get(order_id)
         if fresh:
             self._emit(fresh, self.replies.done(fresh), str(final_path))
+
+    # ── 多剧集 ─────────────────────────────────────────────────────
+    def _plan_series(self, order_id: int, chosen, title: str
+                     ) -> "series_mod.SeriesPlan":
+        """判断这条链接对应几集。任何异常都退化成单集，不让订单因此挂掉。"""
+        def log(message: str) -> None:
+            self.store.log(order_id, message)
+
+        # 每条订单可以带自己的选集（界面上的"合集可勾选"）：放进订单 meta，
+        # 这里用一个**配置副本**覆盖，不动全局配置（否则并发订单会互相串）。
+        config = self.config
+        order = self.store.get(order_id)
+        picked = ""
+        if order is not None and isinstance(order.meta, dict):
+            picked = str(order.meta.get("episode_range") or "").strip()
+        if picked:
+            config = self.config.copy()
+            config.set("download.series.episode_range", picked)
+            self.store.log(order_id, f"本单选集：{picked}")
+
+        try:
+            plan = series_mod.plan(
+                chosen.url,
+                config=config,
+                engine=self.downloader.ytdlp,
+                title_hint=title,
+                log=log,
+            )
+        except Exception as exc:  # noqa: BLE001 - 展开失败只该退化成单集
+            self.store.log(order_id, f"合集展开异常，按单集处理："
+                                     f"{type(exc).__name__}: {exc}", level="warn")
+            return series_mod.SeriesPlan(
+                title=title,
+                episodes=[series_mod.Episode(index=1, url=chosen.url, title=title)],
+                source="single",
+            )
+        if plan.is_series:
+            self.store.log(order_id, f"识别为多剧集：{plan.describe()}")
+        elif plan.note:
+            self.store.log(order_id, f"多剧集：{plan.note}")
+        return plan
+
+    def _run_series(self, order_id: int, plan: "series_mod.SeriesPlan",
+                    cancel: threading.Event) -> None:
+        """逐集下载 → 打包 → 落单。
+
+        刻意**不引入新的订单状态**：一次合集仍然是一笔订单（客户也是按一笔付钱），
+        只是产物从「一个文件」变成「一个压缩包」。状态机保持不变，控制台、
+        桥接回传、上传通道全都不用改。
+        """
+        order = self.store.get(order_id)
+        if order is None:
+            return
+        base_meta = dict(order.meta or {})
+        title = plan.title or order.title or "合集"
+        job_dir = job_dir_for(self.download_dir, order_id)
+        episodes_dir = job_dir / "episodes"
+        episodes_dir.mkdir(parents=True, exist_ok=True)
+        # 开跑前清掉上一轮的逐集产物。与「单订单一个目录」同一个道理：
+        # 订单重试时会复用同一个 job_dir，而 _place_episode 走 ensure_unique，
+        # 不清理就会堆出 "01 xxx (2).mp4"，zip 里出现重复集。
+        # （Downloader._clean_job_dir 只删顶层文件、不递归子目录，所以这里要自己来。）
+        self._clean_series_dir(episodes_dir)
+
+        total = plan.count
+        files: list[Path] = []
+        failures: list[str] = []
+        last_store_write = [0.0]
+        reports_sent = [0]
+        last_report = [-1e9]
+        min_seconds = float(self.config.get("replies.progress_min_seconds", 20) or 0)
+        max_reports = int(self.config.get("replies.progress_max_count", 3) or 0)
+        dl_started = time.time()
+
+        for position, episode in enumerate(plan.episodes, 1):
+            if cancel.is_set():
+                self._finish_cancelled(order_id)
+                return
+
+            stage = f"下载第 {position}/{total} 集"
+            self.store.update(order_id, status=OrderStatus.DOWNLOADING.value,
+                              stage=stage,
+                              progress=round((position - 1) / total * 100, 1))
+            episode_dir = episodes_dir / f"{position:02d}"
+
+            def on_progress(p: Progress, _pos=position) -> None:
+                now = time.time()
+                if now - last_store_write[0] >= STORE_PROGRESS_INTERVAL:
+                    last_store_write[0] = now
+                    overall = ((_pos - 1) + max(0.0, p.percent) / 100.0) / total * 100
+                    self.store.update(order_id, progress=round(overall, 1),
+                                      stage=p.stage or f"下载第 {_pos}/{total} 集")
+                if p.percent <= 0 or reports_sent[0] >= max_reports:
+                    return
+                if now - dl_started < min_seconds:
+                    return
+                if not self.replies.should_report_progress(p.percent, last_report[0]):
+                    return
+                last_report[0] = p.percent
+                reports_sent[0] += 1
+                fresh = self.store.get(order_id)
+                if fresh:
+                    fresh.progress = p.percent
+                    self._emit(fresh, self.replies.progress(fresh, p.percent, p.eta))
+
+            result = self._download_episode(episode, episode_dir, plan,
+                                            progress=on_progress, cancel=cancel)
+            if cancel.is_set():
+                self._finish_cancelled(order_id)
+                return
+
+            if not result.ok:
+                failures.append(f"第{position}集：{result.error}")
+                self.store.log(order_id, f"第 {position}/{total} 集下载失败："
+                                         f"{result.error}", level="error")
+                continue
+
+            named = self._place_episode(result, episode, position, episodes_dir,
+                                        series_title=plan.title)
+            files.append(named)
+            self.store.log(order_id, f"第 {position}/{total} 集完成：{named.name}"
+                                     f"（{named.stat().st_size / 1024 / 1024:.1f} MB）")
+
+        if not files:
+            error = "；".join(failures[:3]) or "所有集都下载失败"
+            self.store.update(order_id, status=OrderStatus.FAILED.value,
+                              stage="合集下载失败", error=error)
+            fresh = self.store.get(order_id)
+            if fresh:
+                self._emit(fresh, self.replies.failed(fresh))
+            return
+
+        # ── 打包 ───────────────────────────────────────────────────
+        mode = str(self.config.get("download.series.mode", "zip") or "zip").lower()
+        # 重新读一次 meta 再合并：一批 50 集要跑几十分钟，中途若有别的写入者
+        # 给这单补过 meta，整列覆盖（Store.update 是 SET meta=?）会把它抹掉。
+        current = self.store.get(order_id)
+        meta = dict(current.meta if current else base_meta) or {}
+        meta["series"] = {
+            "title": title,
+            "count": total,                     # 本次计划要下的集数
+            "downloaded": len(files),           # 真正下成功的集数
+            "failed": failures,
+            "source": plan.source,
+            "mode": mode,
+            "truncated": bool(plan.truncated),  # 是否被 max_episodes 截断
+            "files": [p.name for p in files],
+        }
+        if plan.truncated:
+            self.store.log(
+                order_id,
+                f"注意：这次只下了 {total} 集，已达 download.series.max_episodes "
+                f"上限，原列表可能更长", level="warn",
+            )
+
+        deliverable = files[0]
+        if mode == "zip" and len(files) > 1:
+            self.store.update(order_id, status=OrderStatus.PACKAGING.value,
+                              stage=f"打包 {len(files)} 集", progress=99.0,
+                              meta=meta)
+            archive_path, error = series_mod.archive(files, job_dir / f"{title}.zip")
+            if archive_path is None:
+                self.store.log(order_id, f"打包失败，改为逐文件交付：{error}",
+                               level="warn")
+            else:
+                deliverable = archive_path
+
+        self.store.update(order_id, status=OrderStatus.PACKAGING.value,
+                          stage="整理文件", progress=100.0, meta=meta)
+        final_path = self._finalize(Path(deliverable), title)
+        size = final_path.stat().st_size if final_path.exists() else 0
+
+        error_note = ""
+        if failures:
+            error_note = (f"{len(failures)}/{total} 集失败：" + "；".join(failures[:2]))
+        self.store.update(
+            order_id, status=OrderStatus.DONE.value, stage="已完成",
+            title=title, file_path=str(final_path), file_size=size,
+            progress=100.0, error=error_note,
+        )
+        self.store.log(
+            order_id,
+            f"合集完成：{len(files)}/{total} 集，交付 {final_path.name}"
+            f"（{size / 1024 / 1024:.1f} MB）"
+            + (f"；{error_note}" if error_note else ""),
+        )
+        fresh = self.store.get(order_id)
+        if fresh:
+            note = (self.replies.series_truncated_note(total)
+                    if plan.truncated else "")
+            self._emit(fresh,
+                       self.replies.series_done(fresh, len(files), total=total,
+                                                failed=len(failures), note=note),
+                       str(final_path))
+
+    def _download_episode(self, episode: "series_mod.Episode", episode_dir: Path,
+                          plan: "series_mod.SeriesPlan",
+                          progress: Callable[[Progress], None],
+                          cancel: threading.Event) -> DownloadResult:
+        """下一集。视频号走它自己的解析链（按 object_id / export_id 定位）。"""
+        hint = episode.hint(plan.title)
+        if episode.source == "wechat_channels" and not episode.url:
+            return self.downloader.download_channels_episode(
+                episode.object_id, episode.export_id, episode_dir,
+                title_hint=hint, progress=progress, cancel=cancel)
+        return self.downloader.download(
+            episode.url, episode_dir, kind="page", title_hint=hint,
+            progress=progress, cancel=cancel)
+
+    @staticmethod
+    def _clean_series_dir(episodes_dir: Path) -> None:
+        """清空合集目录里的上一轮产物（文件与逐集子目录一起，否则会堆重复集）。"""
+        import shutil
+
+        try:
+            items = list(episodes_dir.iterdir())
+        except OSError:
+            return
+        for item in items:
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _place_episode(result: DownloadResult, episode: "series_mod.Episode",
+                       position: int, episodes_dir: Path,
+                       series_title: str = "") -> Path:
+        """把某一集的产物搬到 ``episodes/`` 并改成 ``01 标题.mp4``。
+
+        编号是必须的：客户拿到一堆积名字相似的 mp4，没有序号根本排不出顺序。
+        标题也要"去冗余"：yt-dlp 给多分P的标题是「合集名 p01 分P名」，
+        而分P名常常就是合集名，原样落盘会得到 ``01 某某 p01 某某.mp4``。
+
+        编号用**原始集号**而不是本次循环序号：运营用 ``episode_range=9,10``
+        只下第 9、10 集时，文件名得是 ``09/10`` —— 写成 ``01/02`` 客户会以为
+        收到的是前两集。
+        """
+        source = Path(result.file_path)
+        suffix = source.suffix or ".mp4"
+        number = episode.index if episode.index and episode.index > 0 else position
+        title = (series_mod.clean_episode_title(episode.title, series_title)
+                 or series_mod.clean_episode_title(result.title, series_title)
+                 or f"第{number}集")
+        target = episodes_dir / series_mod.episode_filename(number, title, suffix)
+        target = ensure_unique(target)
+        try:
+            if source.parent != episodes_dir:
+                source.replace(target)
+            else:
+                return source
+            return target
+        except OSError:
+            return source
 
     # ── 辅助 ───────────────────────────────────────────────────────
     def _finalize(self, path: Path, title: str) -> Path:

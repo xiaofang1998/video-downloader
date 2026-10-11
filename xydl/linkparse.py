@@ -73,6 +73,15 @@ class PlatformRule:
     short_domains: tuple[str, ...] = ()
     drm: bool = False
     note: str = ""
+    #: 短链域名是否只按**完全相同**的主机名匹配（不匹配子域）。
+    #:
+    #: 为什么需要这个开关：微信视频号的分享短链是 ``weixin.qq.com/sph/x``，
+    #: 而落地页是 ``channels.weixin.qq.com/finder-preview/pages/sph?id=x``
+    #: —— ``channels.weixin.qq.com`` 是 ``weixin.qq.com`` 的**子域**。
+    #: 若按后缀匹配短链，落地页会被反复判成"短链"再去展开一次，展开不出来
+    #: （它已经是终点），整条解析链就断了。抖音的 ``v.douyin.com`` 恰好相反，
+    #: 必须按后缀匹配（它的短链就是子域），所以做成 per-platform 开关。
+    short_exact: bool = False
 
     @property
     def all_domains(self) -> tuple[str, ...]:
@@ -97,9 +106,17 @@ PLATFORMS: tuple[PlatformRule, ...] = (
     PlatformRule("weibo", "微博",
                  ("weibo.com", "weibo.cn", "miaopai.com"),
                  short_domains=("t.cn",)),
-    PlatformRule("wechat", "微信",
-                 ("channels.weixin.qq.com", "mp.weixin.qq.com", "weixin.qq.com"),
-                 note="视频号内容通常无法直接下载，需要录屏或向原作者索取"),
+    # 微信视频号：分享短链是 weixin.qq.com/sph/<码>，必须展开成
+    # channels.weixin.qq.com/finder-preview/pages/sph?id=<码> 才能定位内容。
+    # weixin.qq.com 只登记为**短链域名**（它还有其他用途），靠 /sph/ 路径识别。
+    PlatformRule("wechat_channels", "微信视频号",
+                 ("channels.weixin.qq.com",),
+                 short_domains=("weixin.qq.com",),
+                 short_exact=True,
+                 note="视频号：匿名可拿标题/封面，mp4 需要 TikHub key 或扫码登录"),
+    # 公众号文章（跟视频号是两码事，混在一起会让 code 全走错分支）
+    PlatformRule("wechat_mp", "微信公众号", ("mp.weixin.qq.com",),
+                 note="公众号文章里的视频多为腾讯视频源，通常有版权保护"),
     PlatformRule("xigua", "西瓜视频", ("ixigua.com", "toutiao.com")),
     PlatformRule("haokan", "好看视频", ("haokan.baidu.com",)),
     PlatformRule("pipixia", "皮皮虾", ("pipix.com", "ippzone.com")),
@@ -183,7 +200,11 @@ def is_short_link(url: str, rule: PlatformRule | None = None) -> bool:
     rule = rule or detect_platform(url)
     if rule is None:
         return False
-    return domain_matches(host_of(url), rule.short_domains)
+    host = host_of(url)
+    if rule.short_exact:
+        # 只认完全一致的主机名（见 PlatformRule.short_exact 的说明）
+        return host in tuple(d.lower() for d in rule.short_domains)
+    return domain_matches(host, rule.short_domains)
 
 
 # ── URL 清洗 ──────────────────────────────────────────────────────────
@@ -364,6 +385,7 @@ _AUTHOR_BRACKET_RE = re.compile(r"^@?[^【】]{1,30}的(?:作品|视频|主页|�
 
 _PLATFORM_WORDS = (
     r"(?:抖音|快手|小红书|哔哩哔哩|B站|b站|微视|微博|西瓜视频|好看视频|"
+    r"视频号|微信|"
     r"YouTube|油管|TikTok|Dou音|Douyin|Xiaohongshu|Instagram|Ins)"
 )
 

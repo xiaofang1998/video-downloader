@@ -33,6 +33,11 @@ from xydl.linkparse import (
     ("https://x.com/u/status/1", "twitter"),
     ("https://v.qq.com/x/cover/a.html", "tencent_video"),
     ("https://m.tb.cn/h.5xYz", "xianyu"),
+    # ── 微信：视频号和公众号是两码事 ────────────────────────────
+    ("https://weixin.qq.com/sph/AJizVCRhAt", "wechat_channels"),
+    ("https://channels.weixin.qq.com/finder-preview/pages/sph?id=x", "wechat_channels"),
+    ("https://channels.weixin.qq.com/web/pages/feed?eid=x", "wechat_channels"),
+    ("https://mp.weixin.qq.com/s/abcdefg", "wechat_mp"),
     ("https://example.com/x", None),
     # ── 新增平台：国内社区视频 ──────────────────────────────────
     ("https://www.acfun.cn/v/ac12345", "acfun"),
@@ -67,6 +72,12 @@ def test_detect_platform(url, expected):
     ("https://xhslink.com/a/x", True),
     ("https://www.xiaohongshu.com/explore/1", False),
     ("https://example.com/x", False),
+    # 视频号：分享短链要展开，而落地页（channels.weixin.qq.com）是
+    # weixin.qq.com 的**子域** —— 必须只按完全一致匹配，否则落地页会被
+    # 反复当成短链再展开一次，整条解析链断掉。
+    ("https://weixin.qq.com/sph/AJizVCRhAt", True),
+    ("https://channels.weixin.qq.com/finder-preview/pages/sph?id=AJizVCRhAt", False),
+    ("https://channels.weixin.qq.com/web/pages/feed?eid=export%2Fabc", False),
 ])
 def test_short_link_is_per_domain(url, is_short):
     assert is_short_link(url) is is_short

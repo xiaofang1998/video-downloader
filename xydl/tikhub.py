@@ -6,6 +6,10 @@
 
 需要 TikHub.io 的 API key（免费注册 + 每日签到领额度），填到
 config.json 的 ``delivery.tikhub.api_key``。
+
+同一个 key 也用于**微信视频号**（``/api/v1/wechat_channels/v2/*``）。视频号那部分
+的端点与解析放在 :mod:`xydl.wechat_channels` 里 —— 因为它要跟短码/exportId、
+登录态浏览器、128KB 解密配合，塞在这里会让本模块变成大杂烩。
 """
 
 from __future__ import annotations

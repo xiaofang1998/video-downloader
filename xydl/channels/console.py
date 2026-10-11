@@ -25,6 +25,9 @@ from .base import Channel
 from ..config import ROOT, Config, bundle_dir
 from ..models import Order
 from ..utils import snippet
+# 登录页地址从 wechat_channels 拿，避免两处各写一份然后悄悄跑偏
+# （`/web/pages/home` 是匿名返回 JSON 10012 的死路，踩过）
+from ..wechat_channels import WEB_HOME_PAGE as WECHAT_CHANNELS_LOGIN_URL
 
 #: 用 bundle_dir() 而不是 ROOT：打包成桌面应用后源码不在磁盘上，
 #: 页面是作为资源随包走的，得从 _MEIPASS 里找。
@@ -162,6 +165,9 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 self._api_state()
                 return
+            if path == "/api/plan" and method == "POST":
+                self._api_plan()
+                return
             if path == "/api/orders":
                 if method == "POST":
                     self._api_create()
@@ -231,6 +237,42 @@ class _Handler(BaseHTTPRequestHandler):
         )
         self._json(200, {"ok": True, "orders": [o.to_dict() for o in orders]})
 
+    def _api_plan(self) -> None:
+        """预演一条链接要下什么（不下载），给界面做"合集可勾选"用。
+
+        为什么要有这个接口：粘一条合集里的某一集时，工具会识别出整部；
+        **不能默默全下** —— 先把剧集列表摊开给用户看，让他勾。
+        """
+        from .. import linkparse
+        from .. import series as series_mod
+
+        data = self._read_json()
+        text = str(data.get("text") or "").strip()
+        if not text:
+            raise ValueError("text 不能为空")
+        parsed = linkparse.parse(text)
+        url = parsed.links[0].url if parsed.links else text
+        plan = series_mod.plan(
+            url, config=self.pipeline.config,
+            engine=self.pipeline.downloader.ytdlp,
+            log=lambda _m: None)
+        self._json(200, {
+            "ok": True,
+            "url": url,
+            "is_series": plan.is_series,
+            "title": plan.title,
+            "source": plan.source,
+            "truncated": plan.truncated,
+            "error": plan.error,
+            "note": plan.note,
+            "total": len(plan.episodes),
+            "episodes": [
+                {"index": ep.index, "title": ep.title or f"第{ep.index}集",
+                 "url": ep.url, "source": ep.source}
+                for ep in plan.episodes
+            ],
+        })
+
     def _api_create(self) -> None:
         data = self._read_json()
         text = str(data.get("text") or "").strip()
@@ -242,12 +284,18 @@ class _Handler(BaseHTTPRequestHandler):
         meta = data.get("meta")
         if meta is not None and not isinstance(meta, dict):
             raise ValueError("meta 必须是 JSON 对象")
+        meta = dict(meta or {})
+        # 界面上勾选的合集集号（"1,3,5-8"）。放 meta 里，只对这一单生效，
+        # 不动全局配置 —— 否则并发下单会互相串选集。
+        picked = str(data.get("episode_range") or "").strip()
+        if picked:
+            meta["episode_range"] = picked
         order, created = self.pipeline.submit_text(
             text=text,
             conversation_id=str(data.get("conversation_id") or "").strip() or "console",
             channel=str(data.get("channel") or "console").strip() or "console",
             sender=str(data.get("sender") or "").strip(),
-            meta=meta or {},
+            meta=meta,
         )
         self._json(200, {"ok": True, "created": created, "order": order.to_dict()})
 
@@ -323,28 +371,40 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "path": str(directory),
                          "opened": open_in_file_manager(directory)})
 
+    #: 支持在控制台里一键登录的站点：key → 登录页地址
+    LOGIN_SITES = {
+        "douyin": "https://www.douyin.com/",
+        "tiktok": "https://www.tiktok.com/",
+        # 视频号要用 `/platform`（视频号助手）才有二维码；`/web/pages/home`
+        # 匿名访问返回的是 JSON 10012，浏览器打开一片空白（实测踩过）。
+        "wechat_channels": WECHAT_CHANNELS_LOGIN_URL,
+    }
+
     def _api_cdp_login(self) -> None:
-        """触发登录抖音/TikTok（登录态存进独立 profile，作为 TikHub 兜底）。"""
+        """触发登录（登录态存进独立 profile，作为第三方解析的兜底）。
+
+        抖音/TikTok 是 TikHub 的兜底；视频号则是**拿 mp4 的仅有两条第 2 条**
+        —— 匿名接口只给标题/封面。
+        """
         length = int(self.headers.get("Content-Length", 0) or 0)
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except Exception:  # noqa: BLE001
             body = {}
         platform = str(body.get("platform") or "douyin").lower()
-        if platform not in ("douyin", "tiktok"):
-            self._error(400, "platform 只能是 douyin / tiktok")
+        url = self.LOGIN_SITES.get(platform)
+        if url is None:
+            self._error(400, "platform 只能是 " + " / ".join(self.LOGIN_SITES))
             return
 
         def _run() -> None:
             from xydl.cdp_fetch import login
-            login(platform,
-                  "https://www.douyin.com/" if platform == "douyin"
-                  else "https://www.tiktok.com/",
-                  wait_sec=180)
+            login(platform, url, wait_sec=180)
 
         threading.Thread(target=_run, daemon=True).start()
+        label = "视频号" if platform == "wechat_channels" else platform
         self._json(200, {"ok": True,
-                         "message": f"已打开浏览器窗口，请在窗口里扫码登录 {platform}，"
+                         "message": f"已打开浏览器窗口，请在窗口里扫码登录 {label}，"
                                     "登录后关闭窗口即可"})
 
 

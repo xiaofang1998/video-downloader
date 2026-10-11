@@ -149,6 +149,51 @@ def test_cancel_on_finished_order_is_a_noop(config, store, sample_server, pipeli
     assert pipeline.cancel(999999) is False
 
 
+def test_order_episode_range_only_affects_that_order(config, store, pipeline,
+                                                     monkeypatch):
+    """订单 meta 里的 ``episode_range`` 只对本单生效（界面上的合集勾选）。
+
+    为什么重要：合集默认会展开整部，产品要求"可勾选"。选集如果写进全局配置，
+    并发的另一个订单会跟着被裁成同一批集 —— 那种串单 bug 极难查。
+    """
+    seen: dict = {}
+
+    def fake_plan(url, *, config, engine=None, title_hint="", log=None, **kw):
+        seen["range"] = config.get("download.series.episode_range")
+        return series_mod.SeriesPlan(
+            title="某合集", source="bilibili",
+            episodes=[series_mod.Episode(index=13, url="https://x/13", title="第13集"),
+                      series_mod.Episode(index=14, url="https://x/14", title="第14集")])
+
+    monkeypatch.setattr("xydl.pipeline.series_mod.plan", fake_plan)
+
+    order, _ = pipeline.submit_text("https://www.bilibili.com/video/BV1xx411c7mD",
+                                    meta={"episode_range": "13,14"})
+    wait_for_terminal(store, order.id, timeout=40)
+
+    assert seen.get("range") == "13,14", "本单的选集要传进展开逻辑"
+    # 全局配置**不能**被改（否则其它订单会串选集）
+    assert not str(config.get("download.series.episode_range") or "").strip()
+
+    """回归：worker 是"先写终态、再回收标志"，中间那一瞬间标志还在。
+
+    旧实现先看标志、后看状态，于是对**已完成**的订单返回 True（"取消成功"），
+    运营会以为没发出去，其实文件早交付了。表现是整套测试里偶发失败。
+    """
+    import threading
+
+    from xydl.models import OrderStatus
+
+    order, _ = pipeline.submit_text("https://example.com/whatever")
+    store.update(order.id, status=OrderStatus.DONE.value, stage="完成")
+
+    # 手工制造"标志还在"的那个瞬间
+    pipeline._cancel_flags[order.id] = threading.Event()
+
+    assert pipeline.cancel(order.id) is False, "已完成的订单不能报成取消成功"
+    assert order.id not in pipeline._cancel_flags, "残留标志应被顺手清掉"
+
+
 def test_cancel_moves_pending_order_to_cancelled(config, store, pipeline):
     """还没被 worker 捡走的订单，取消应直接改状态。"""
     order, _ = store.create_order("console:manual-1", "console", "b9", "https://x/y")

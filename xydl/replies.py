@@ -17,6 +17,9 @@ from .utils import snippet
 PLACEHOLDERS = (
     "title", "filename", "size", "progress", "platform", "error", "url",
     "eta", "engine", "sender", "order_id", "duration",
+    # 多剧集：{total} 是"应该有几集"，{count} 是"成功几集"，{failed} 是失败数。
+    # 三者必须分开 —— 只用成功数会让"买 50 集只下到 5 集"看起来像全部完成。
+    "count", "total", "failed",
 )
 
 
@@ -84,6 +87,46 @@ class Replies:
             size=human_size(order.file_size),
             url=order.chosen_url,
         )
+
+    def series_done(self, order: Order, count: int, total: int | None = None,
+                    failed: int = 0, note: str = "") -> str:
+        """多剧集交付话术。
+
+        **失败集绝不隐藏**：只要 ``failed > 0``，就一定用「部分成功」话术；
+        运营就算把 ``replies.series_partial`` 清空，也会被追加一句不可移除的提示。
+        理由很简单 —— 代下载是收钱的，买家按"整部剧"付钱，不能让他以为
+        拿到的是全集（这正是本项目在视频号解密那里坚持的同一条原则）。
+        """
+        total = int(total if total is not None else count)
+        failed = int(failed or 0)
+        fields = dict(
+            title=order.title,
+            filename=order.file_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1],
+            size=human_size(order.file_size),
+            count=count,
+            total=total,
+            failed=failed,
+            url=order.chosen_url,
+        )
+
+        if failed:
+            text = self.render("series_partial", **fields)
+            if not text:
+                text = self.render("series_done", **fields) or self.done(order)
+                text = f"{text}\n（注意：共 {total} 集，其中 {failed} 集没下成功）"
+        else:
+            text = self.render("series_done", **fields) or self.done(order)
+
+        if note:
+            text = f"{text}\n{note}"
+        return text
+
+    def series_truncated_note(self, total: int) -> str:
+        """已达单次上限时的补充说明（话术同样放在 config 里，运营可改）。"""
+        template = str(self.config.get("replies.series_truncated_note", "") or "")
+        if not template:
+            return ""
+        return self.render("series_truncated_note", total=total, count=total)
 
     def need_manual(self, order: Order, reason: str = "") -> str:
         base = self.render("need_manual", title=order.title, url=order.chosen_url)

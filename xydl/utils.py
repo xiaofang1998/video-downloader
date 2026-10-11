@@ -153,6 +153,50 @@ def now_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     return datetime.now().strftime(fmt)
 
 
+#: yt-dlp 给 B 站多分P视频的标题格式：``<合集名> pNN <分P名>``
+_PAGE_TITLE_RE = re.compile(r"^(?P<head>.+?)\s+[pP]\d{1,3}\s+(?P<tail>.+)$")
+
+
+def clean_page_title(title: str, maxlen: int = 120) -> str:
+    """把「合集名 pNN 分P名」压成不啰嗦的那一半。
+
+    yt-dlp 对多分P视频给出的标题是 ``<合集名> p01 <分P名>``，而分P名**常常就等于
+    合集名**。原样当文件名会得到 ``某某 p01 某某.mp4`` 这种废话（实测踩到过，
+    56 个字符里一半是重复的）。这里取信息量更大的那一半：
+
+    * 分P名与合集名相同 → 用合集名
+    * 分P名是自己独立的名字 → 用分P名（它比"某某合集"更具体）
+
+    >>> clean_page_title("某某大战 p01 某某大战")
+    '某某大战'
+    >>> clean_page_title("某某大战 p02 实机演示")
+    '实机演示'
+    >>> clean_page_title("普通标题")
+    '普通标题'
+    """
+    text = re.sub(r"\s{2,}", " ", str(title or "")).strip()
+    match = _PAGE_TITLE_RE.match(text)
+    if not match:
+        return text[:maxlen]
+    head = match.group("head").strip()
+    tail = match.group("tail").strip()
+    if not tail:
+        return head[:maxlen]
+    if not head:
+        return tail[:maxlen]
+    # 互相包含（"某某大战" vs "某某大战 第一话"）时取短的那个，避免又臭又长
+    if tail == head:
+        return head[:maxlen]
+    if tail.startswith(head) or head.startswith(tail):
+        shorter = head if len(head) <= len(tail) else tail
+        return shorter[:maxlen]
+    return tail[:maxlen]
+
+
+#: URL 里的分P标记：``?p=1`` / ``&p=2``
+PAGE_MARK_RE = re.compile(r"[?&]p=\d+", re.I)
+
+
 def human_duration(seconds: float) -> str:
     seconds = max(0.0, float(seconds or 0))
     if seconds < 60:

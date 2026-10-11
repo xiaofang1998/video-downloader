@@ -170,10 +170,56 @@
     </div>
     <div class="hint">
       链接、分享文案、甚至只有一句标题都能识别。
+      <br><b>B站</b> 分P / 合集 / 番剧 / UP主投稿会自动识别成多集，打包成 zip 交付。
+      <br><b>微信视频号</b>：粘 <code>weixin.qq.com/sph/…</code> 短链后，工具会引导你去
+      <b>腾讯元宝</b>解析一次，把解析出的链接粘回来即可下载（不需要 TikHub）。
       <br>没带链接时会用标题去 <b>Google / DuckDuckGo</b> 自动找源。
       <br>受版权保护的平台（腾讯视频、爱奇艺等）会自动识别并提示。
       <br><span class="kbd"><code>Ctrl</code> + <code>Enter</code></span> 快速开始
     </div>
+  </section>
+
+  <section class="card" id="wxGuide" style="display:none;border-color:var(--accent)">
+    <h2>微信视频号：需要先过一遍腾讯元宝</h2>
+    <p style="margin:0 0 10px;line-height:1.7">
+      视频号的短链本身**不带授权**，服务端不会下发视频，所以任何工具都要先换一条
+      "带 token 的链接"。这个动作在腾讯元宝里一次就好（免费）：
+      <br><b>①</b> 点下面按钮打开腾讯元宝并登录
+      <br><b>②</b> 把这条链接粘进元宝的对话框发出去
+      <br><b>③</b> 元宝会回一条 <code>channels.weixin.qq.com/finder-preview/pages/feed?token=…&eid=…</code>
+      的链接，复制它
+      <br><b>④</b> 粘到下面这个框里，点「用这条链接下载」
+    </p>
+    <div class="row">
+      <button onclick="openYuanbao()">打开腾讯元宝</button>
+      <button class="ghost" onclick="copyShortLink()">复制刚才那条短链</button>
+      <button class="ghost" onclick="hideWxGuide()">知道了</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="parsedLink" placeholder="把元宝解析出的链接（含 token=…&eid=…）粘到这里">
+      <button id="parsedGo" onclick="submitParsedLink()">用这条链接下载</button>
+    </div>
+  </section>
+
+  <section class="card" id="pickCard" style="display:none;border-color:var(--accent)">
+    <h2>这条链接是合集，选要下哪几集</h2>
+    <p style="margin:0 0 10px;line-height:1.6">
+      <b id="pickTitle">—</b>
+      <span id="pickMeta" class="hint"></span>
+    </p>
+    <div class="row">
+      <button class="ghost" onclick="pickAll(true)">全选</button>
+      <button class="ghost" onclick="pickAll(false)">全不选</button>
+      <button class="ghost" onclick="pickInvert()">反选</button>
+      <span class="hint" id="pickCount" style="align-self:center"></span>
+    </div>
+    <div id="pickList" style="max-height:320px;overflow:auto;margin:10px 0;
+         border:1px solid var(--line);border-radius:10px;padding:6px"></div>
+    <div class="row">
+      <button id="pickGo" class="wide" onclick="submitPicked()">下载选中的集</button>
+      <button class="ghost" onclick="closePick()">取消</button>
+    </div>
+    <div class="hint">不勾选就直接关掉的话，不会下任何东西 —— 防止"以为只下了一集、结果整部下完"。</div>
   </section>
 
   <section class="card">
@@ -219,9 +265,170 @@ function fmtSize(n){
   return v.toFixed(i ? 1 : 0) + ' ' + u[i];
 }
 
+// ── 微信视频号：引导客户过一遍腾讯元宝 ──────────────────────────────
+// 短链（weixin.qq.com/sph/xxx 或裸短码）不带 token，服务端不下发媒体；
+// 元宝解析后会给一条带 token 的 /feed 链接，那条能直接下（明文 MP4）。
+let _wxShortLink = '';
+
+function isChannelsShortLink(t){
+  const s = String(t || '').trim();
+  if(/[?&]token=/i.test(s)) return false;          // 已经带 token 了，直接下
+  if(/weixin\.qq\.com\/sph\//i.test(s)) return true;
+  if(/channels\.weixin\.qq\.com\/finder-preview\/pages\/(feed|sph)/i.test(s)) return true;
+  return /^[A-Za-z0-9_-]{8,16}$/.test(s);          // 裸短码
+}
+
+function showWxGuide(shortLink){
+  _wxShortLink = shortLink;
+  const card = document.getElementById('wxGuide');
+  card.style.display = '';
+  card.scrollIntoView({behavior:'smooth', block:'center'});
+  document.getElementById('parsedLink').focus();
+  toast('这是视频号短链，需要先用腾讯元宝解析一次');
+}
+
+function hideWxGuide(){
+  document.getElementById('wxGuide').style.display = 'none';
+}
+
+function openYuanbao(){
+  window.open('https://yuanbao.tencent.com/', '_blank');
+  toast('登录后把链接粘进对话框发出去，再复制它回的链接');
+}
+
+async function copyShortLink(){
+  try{
+    await navigator.clipboard.writeText(_wxShortLink || document.getElementById('text').value.trim());
+    toast('短链已复制，去元宝对话框粘贴发送');
+  }catch(e){ toast('复制失败，请手动选中：' + e.message, true); }
+}
+
+async function submitParsedLink(){
+  const link = document.getElementById('parsedLink').value.trim();
+  if(!link){ toast('先把元宝解析出的链接粘进来', true); return; }
+  if(!/[?&]token=/i.test(link)){
+    toast('这条链接里没看到 token=，可能复制不全（要含 token=…&eid=…）', true);
+    return;
+  }
+  document.getElementById('text').value = link;
+  document.getElementById('parsedLink').value = '';
+  hideWxGuide();
+  await submitOrder();
+}
+
+// ── 合集可勾选：先预览剧集，再让用户挑 ──────────────────────────────
+// 产品要求：粘了合集里的某一集**不能默默全下**，要把剧集列表摊开给用户勾，
+// 并提供"全选"。所以点下载时先调 /api/plan（不下载），有合集才弹这张卡。
+let _planEpisodes = [];
+
+function episodeRangeOf(){
+  return _planEpisodes.filter(e => e._on).map(e => e.index).join(',');
+}
+
+function renderPick(){
+  const on = _planEpisodes.filter(e => e._on).length;
+  document.getElementById('pickCount').textContent =
+    `已选 ${on} / ${_planEpisodes.length} 集`;
+  document.getElementById('pickGo').disabled = on === 0;
+}
+
+function pickAll(flag){
+  _planEpisodes.forEach(e => { e._on = flag; });
+  document.querySelectorAll('#pickList input[type=checkbox]')
+    .forEach(cb => { cb.checked = flag; });
+  renderPick();
+}
+
+function pickInvert(){
+  _planEpisodes.forEach((e, i) => {
+    e._on = !e._on;
+    const cb = document.querySelector(`#pickList input[data-i="${i}"]`);
+    if(cb) cb.checked = e._on;
+  });
+  renderPick();
+}
+
+function closePick(){
+  document.getElementById('pickCard').style.display = 'none';
+  _planEpisodes = [];
+}
+
+async function submitPicked(){
+  const picked = episodeRangeOf();
+  if(!picked){ toast('一集都没选', true); return; }
+  const text = document.getElementById('text').value.trim();
+  const btn = document.getElementById('pickGo');
+  btn.disabled = true; btn.textContent = '提交中…';
+  try{
+    const r = await fetch(apiUrl('/api/orders'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        text,
+        episode_range: picked,
+        conversation_id: document.getElementById('conversation').value.trim(),
+        sender: document.getElementById('sender').value.trim(),
+      })
+    });
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || '提交失败');
+    toast('已提交 ' + picked.split(',').length + ' 集');
+    document.getElementById('text').value = '';
+    closePick();
+    await refresh();
+  }catch(e){ toast(e.message, true); }
+  finally{ btn.disabled = false; btn.textContent = '下载选中的集'; }
+}
+
+async function openPickPlan(text){
+  const card = document.getElementById('pickCard');
+  card.style.display = '';
+  card.scrollIntoView({behavior:'smooth', block:'center'});
+  document.getElementById('pickTitle').textContent = '正在识别合集…';
+  document.getElementById('pickList').innerHTML = '';
+  document.getElementById('pickMeta').textContent = '';
+  try{
+    const r = await fetch(apiUrl('/api/plan'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text})
+    });
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || '识别失败');
+    if(!d.is_series){
+      // 不是合集：关掉卡片，走普通单集下载
+      closePick();
+      return false;
+    }
+    _planEpisodes = (d.episodes || []).map(e => ({
+      index: e.index, title: e.title, _on: true,
+    }));
+    document.getElementById('pickTitle').textContent = d.title || '合集';
+    document.getElementById('pickMeta').textContent =
+      `共 ${d.total} 集` + (d.truncated ? '（已达单次上限，实际更多）' : '');
+    document.getElementById('pickList').innerHTML = _planEpisodes.map((e, i) => `
+      <label style="display:flex;gap:8px;align-items:center;padding:5px 6px;
+                    border-bottom:1px solid var(--line)">
+        <input type="checkbox" data-i="${i}" checked
+               onchange="_planEpisodes[${i}]._on=this.checked;renderPick()">
+        <span style="opacity:.55;min-width:34px">${e.index}</span>
+        <span>${esc(e.title)}</span>
+      </label>`).join('');
+    renderPick();
+    return true;
+  }catch(e){
+    toast('识别合集失败：' + e.message, true);
+    closePick();
+    return false;
+  }
+}
+
 async function submitOrder(){
   const text = document.getElementById('text').value.trim();
   if(!text){ toast('先粘贴视频链接', true); return; }
+  // 视频号短链先别提交：它不带 token，下了也拿不到视频。
+  // 按产品流程引导客户去腾讯元宝换一条带 token 的链接再粘回来。
+  if(isChannelsShortLink(text)){ showWxGuide(text); return; }
+  // 是合集就先弹勾选卡片（**不**默默全下）
+  if(await openPickPlan(text)) return;
   const btn = document.getElementById('submit');
   btn.disabled = true; btn.textContent = '提交中…';
   try{
@@ -317,6 +524,7 @@ function renderChips(d){
     + `<span class="chip btn" onclick="revealDir()" title="${esc(d.download_dir||'')}">📁 下载目录</span>`
     + `<span class="chip btn" onclick="loginPlatform('douyin')" title="登录态兜底：抖音（TikHub 额度不够时用）">🔑 登录抖音</span>`
     + `<span class="chip btn" onclick="loginPlatform('tiktok')" title="登录态兜底：TikTok">🔑 登录TikTok</span>`
+    + `<span class="chip btn" onclick="loginPlatform('wechat_channels')" title="登录视频号助手（创作者后台，诊断用）。实测它拿不到别人视频的 mp4 —— 视频号下载请配 delivery.tikhub.api_key">🎬 视频号登录(诊断)</span>`
     + `<span class="chip" title="${esc((d.engines||[]).join(' / '))}">引擎 <b>${esc((d.engines||[])[0]||'-')}</b></span>`;
 }
 
@@ -358,6 +566,17 @@ function renderOrders(orders){
       : '';
     const file = o.file_path
       ? `<div class="meta">文件：<b>${esc(o.file_path.split(/[\\/]/).pop())}</b> · ${fmtSize(o.file_size)}</div>` : '';
+    // 多剧集：把「下到第几集了 / 哪几集失败」摊开，否则运营只能看到一根进度条
+    const series = (o.meta && o.meta.series) ? o.meta.series : null;
+    const seriesInfo = series
+      ? `<div class="meta">合集：<b>${esc(series.title || '')}</b> · `
+        + `已下 <b>${series.downloaded || 0}</b>/${series.count || 0} 集`
+        + (series.mode === 'zip' ? ' · 已打包 zip' : '')
+        + (series.truncated ? ' · <span style="color:var(--warn)">已达单次上限，原列表更长</span>' : '')
+        + (series.failed && series.failed.length
+            ? ` · <span style="color:var(--warn)">失败 ${series.failed.length} 集</span>` : '')
+        + `</div>`
+      : '';
     const err = o.error ? `<div class="meta" style="color:var(--warn)">${esc(o.error)}</div>` : '';
 
     return `<div class="order ${cls}">
@@ -368,7 +587,7 @@ function renderOrders(orders){
       </div>
       <div class="msg">${esc(msg)}</div>
       <div class="bar ${cls}"><i style="width:${pct}%"></i></div>
-      ${title}${src}${file}${err}
+      ${title}${seriesInfo}${src}${file}${err}
       ${o.reply ? `<div class="reply"><div class="reply-txt">${esc(o.reply)}</div></div>` : ''}
       <div class="acts">
         ${o.file_path ? `<button class="tiny" onclick="downloadFile(${o.id})">⬇ 下载文件</button>` : ''}
@@ -383,12 +602,15 @@ function renderOrders(orders){
       <pre id="log-${o.id}" style="display:none"></pre>
     </div>`;
   }).join('');
+  // 列表每 2 秒重建一次，会把展开的日志 <pre> 一起重置掉 —— 这里把它恢复回来。
+  restoreOpenLog();
 }
 
-async function toggleDetail(id){
-  const el = document.getElementById('log-' + id);
-  if(el.style.display !== 'none'){ el.style.display = 'none'; return; }
-  el.style.display = 'block';
+//: 当前展开着日志的订单号。刷新重建列表后要靠它把日志重新展开，
+//: 否则用户点开「📜 日志」只看得到一两秒就被刷没了。
+let _openLog = null;
+
+async function fillLog(id, el){
   el.textContent = '加载中…';
   try{
     const r = await fetch(apiUrl('/api/orders/' + id));
@@ -400,7 +622,29 @@ async function toggleDetail(id){
     const head = `任务 #${d.id}  状态=${d.status}  阶段=${d.stage}\n`
       + `识别到 ${(d.links||[]).length} 条链接\n` + '-'.repeat(60) + '\n';
     el.textContent = head + (lines.join('\n') || '（暂无日志）');
+    el.scrollTop = el.scrollHeight;
   }catch(e){ el.textContent = '读取日志失败：' + e.message; }
+}
+
+async function restoreOpenLog(){
+  if(_openLog == null) return;
+  const el = document.getElementById('log-' + _openLog);
+  if(!el) return;                 // 这个订单被删了/不在列表里
+  el.style.display = 'block';
+  await fillLog(_openLog, el);
+}
+
+async function toggleDetail(id){
+  const el = document.getElementById('log-' + id);
+  if(!el) return;
+  if(el.style.display !== 'none'){
+    el.style.display = 'none';
+    if(_openLog === id) _openLog = null;
+    return;
+  }
+  _openLog = id;
+  el.style.display = 'block';
+  await fillLog(id, el);
 }
 
 document.getElementById('text').addEventListener('keydown', ev => {

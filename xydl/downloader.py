@@ -22,12 +22,16 @@ import sys
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from . import linkparse
+from . import utils
+from . import wechat_channels
+from . import wxdecrypt
 from .config import Config, app_dir, bundle_dir
+from . import twitter as twitter_mod
 from .http import HttpError, open_stream, parse_proxy_spec, system_proxy_url
 from .models import DownloadResult, human_size
 from .utils import clean_media_title, ensure_unique, sanitize_filename
@@ -525,6 +529,48 @@ class YtDlpEngine:
                     return {}
             return {}
 
+    # ── 第一步半：探测「是不是多集」─────────────────────────────────
+    def probe_playlist(self, url: str, limit: int = 50) -> dict:
+        """轻量探测「这条链接是不是多集」。
+
+        刻意用 ``--flat-playlist``：只取条目清单（id/url），**不解析每一集的详情**。
+        一集一集去 ``-J`` 会让一个 50 集的合集探测变成 50 次请求，又慢又容易触发
+        风控，而每集真正的标题在下载时反正还要再探一次。
+
+        返回 yt-dlp 的 JSON（``_type=playlist`` 且有多个 entries 即多集）；
+        失败返回 ``{}``。
+        """
+        base = self._resolve_base_cmd()
+        if base is None:
+            return {}
+        cmd = [*base, "-J", "--flat-playlist", "--no-warnings", "--ignore-config",
+               "--playlist-end", str(max(1, int(limit)))]
+        if self.proxy:
+            cmd += ["--proxy", self.proxy]
+        cmd += self._cookie_args(url)
+        cmd.append(url)
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=180, env=self._child_env(),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            start, end = raw.find("{"), raw.rfind("}")
+            if 0 <= start < end:
+                try:
+                    return json.loads(raw[start:end + 1])
+                except json.JSONDecodeError:
+                    return {}
+            return {}
+
     # ── 第二步：真正下载 ───────────────────────────────────────────
     def download(self, url: str, job_dir: Path, *,
                  title_hint: str = "",
@@ -542,7 +588,14 @@ class YtDlpEngine:
         meta = self.probe(url)
         # 平台给的 title 可能是「标题 + 换行 + 整段简介」，先收拾干净
         title_maxlen = int(self.config.get("download.title_maxlen", 60) or 60)
-        title = clean_media_title(str(meta.get("title") or ""), title_maxlen)
+        raw_title = str(meta.get("title") or "")
+        # B站分P链接（?p=N）拿到的标题是「合集名 pNN 分P名」，分P名常常就是合集名。
+        # 先按分P规则压一次再截断 —— 顺序不能反：先截断会把 " p02 分P名" 切掉，
+        # 就没法判断重复了。
+        # 只在 B 站链接上做：`?p=` 这个参数别的站点也可能用，标题规则不该乱套。
+        if utils.PAGE_MARK_RE.search(url) and _is_bilibili(url):
+            raw_title = utils.clean_page_title(raw_title)
+        title = clean_media_title(raw_title, title_maxlen)
         title = title or title_hint or "video"
         maxlen = int(self.config.get("download.filename_maxlen", 60) or 60)
         # '%' 在 yt-dlp 的输出模板里有特殊含义，这里直接剔除，避免踩坑
@@ -707,7 +760,6 @@ class YtDlpEngine:
         ), raw_log
 
     @staticmethod
-    @staticmethod
     def _clean_job_dir(job_dir: Path) -> None:
         """清空任务目录里的成品文件。
 
@@ -804,6 +856,18 @@ class YtDlpEngine:
 # ══════════════════════════════════════════════════════════════════════
 #  直链 HTTP
 # ══════════════════════════════════════════════════════════════════════
+#: 能直接当成品交付的扩展名
+_MEDIA_SUFFIXES = frozenset({
+    ".mp4", ".m4v", ".flv", ".f4v", ".mov", ".webm", ".mkv", ".avi", ".ts",
+    ".mp3", ".m4a", ".aac", ".wav", ".opus",
+})
+#: CDN 直链最后一段的"接口名"，不是文件名
+_GENERIC_STEMS = frozenset({
+    "stodownload", "download", "video", "media", "play", "playurl", "v",
+    "getmedia", "get_media", "stream", "index",
+})
+
+
 class HttpEngine:
     """直接 HTTP 下载，用于 ``.mp4`` / ``.webm`` 这类直链。"""
 
@@ -841,14 +905,16 @@ class HttpEngine:
     def download(self, url: str, job_dir: Path, *,
                  title_hint: str = "",
                  progress: ProgressCallback = _noop,
-                 cancel: threading.Event | None = None) -> DownloadResult:
+                 cancel: threading.Event | None = None,
+                 headers: dict[str, str] | None = None) -> DownloadResult:
         started = time.time()
         job_dir = Path(job_dir)
         job_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             resp = open_stream(url, timeout=self.timeout, proxy=self.proxy,
-                               user_agent=self.ua, verify_tls=self.verify_tls)
+                               user_agent=self.ua, verify_tls=self.verify_tls,
+                               headers=headers)
         except HttpError as exc:
             return DownloadResult(False, engine=self.name, error=str(exc))
         except Exception as exc:  # noqa: BLE001 - 网络异常兜底
@@ -875,9 +941,16 @@ class HttpEngine:
 
             raw_name = self.guess_filename(url, headers.get("content-disposition", ""))
             maxlen = int(self.config.get("download.filename_maxlen", 80) or 80)
-            suffix = Path(raw_name).suffix or ".mp4"
-            base_name = sanitize_filename(Path(raw_name).stem or title_hint or "video",
-                                          maxlen=maxlen)
+            suffix = Path(raw_name).suffix
+            if suffix.lower() not in _MEDIA_SUFFIXES:
+                suffix = ".mp4"
+            stem = Path(raw_name).stem
+            # CDN 直链的最后一段常常是接口名而不是文件名
+            # （视频号就是 .../stodownload?...）。这种"名字"没有任何信息量，
+            # 用标题提示顶掉它，否则会落一堆 stodownload.mp4。
+            if not stem or stem.lower() in _GENERIC_STEMS:
+                stem = title_hint or stem or "video"
+            base_name = sanitize_filename(stem, maxlen=maxlen)
             dest = ensure_unique(job_dir / f"{base_name}{suffix}")
 
             progress(Progress(percent=0.0, total=total, stage="开始下载"))
@@ -953,6 +1026,13 @@ def _is_douyin(url: str) -> bool:
     return host == "douyin.com" or host.endswith((".douyin.com", "iesdouyin.com"))
 
 
+def _is_bilibili(url: str) -> bool:
+    """是不是 B 站链接（分P标题规则只对 B 站有意义）。"""
+    host = (linkparse.host_of(url) or "").lower()
+    return any(host == h or host.endswith("." + h)
+               for h in ("bilibili.com", "b23.tv", "bili2233.cn", "acg.tv"))
+
+
 def _is_tiktok(url: str) -> bool:
     host = (linkparse.host_of(url) or "").lower()
     return host == "tiktok.com" or host.endswith(".tiktok.com")
@@ -964,6 +1044,16 @@ _COOKIE_NEEDED_RE = re.compile(r"cookie", re.I)
 def _needs_cookie(error: str) -> bool:
     """错误是不是「需要 cookie」这一类（抖音/小红书风控）的信号。"""
     return bool(error) and bool(_COOKIE_NEEDED_RE.search(error))
+
+
+#: 403 的几种常见写法。**不能只用 ``"403" in error``**：任何含这三个数字的
+#: 文案都会误触发重试（比如"超时 1403 秒"）。
+_FORBIDDEN_RE = re.compile(r"\b403\b|\bforbidden\b", re.I)
+
+
+def _is_forbidden(error: str) -> bool:
+    """这个下载错误是不是「403 被拒」。"""
+    return bool(error) and bool(_FORBIDDEN_RE.search(str(error)))
 
 
 def kuaishou_photo_url(url: str) -> tuple[str, str]:
@@ -1056,6 +1146,9 @@ class Downloader:
 
         直链的 ``.mp4`` 用 yt-dlp 也是对的（它内部走 HTTP 并顺带拿元数据），
         所以这里不必按 kind 分叉，一路降级到底即可。
+
+        例外：微信视频号既没有 yt-dlp 解析器、也没有匿名直链，必须先经过
+        :mod:`xydl.wechat_channels` 的解析链拿到 mp4 地址，再走直链下载 + 解密。
         """
         job_dir = Path(job_dir)
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -1066,6 +1159,33 @@ class Downloader:
 
         attempts: list[str] = []
         cancelled = lambda: cancel is not None and cancel.is_set()  # noqa: E731
+
+        # 微信视频号：先解析出直链（TikHub / 登录态浏览器），再直链下载 + 解密。
+        # 不放进下面的 yt-dlp 降级链里，是因为 yt-dlp 对视频号**必然失败**，
+        # 白跑一次只会多花几十秒还给出误导性的报错。
+        if wechat_channels.is_channels_url(url):
+            result = self.download_channels_url(
+                url, job_dir, title_hint=title_hint, progress=progress, cancel=cancel)
+            if result.ok or cancelled():
+                return result
+            attempts.append(f"视频号：{result.error}")
+        elif wechat_channels.is_channels_cdn_url(url):
+            # 本地抓包工具（wx_channels_download / mitmproxy 等）给出来的是**媒体直链**。
+            # 下下来的是加密文件：没有 decode_key 就解不开，**绝不能当成成功交付**。
+            result = self.http.download(url, job_dir, title_hint=title_hint,
+                                        progress=progress, cancel=cancel)
+            if result.ok and wxdecrypt.needs_decrypt(result.file_path):
+                return DownloadResult(
+                    False, engine="http", title=result.title,
+                    file_path=result.file_path,
+                    error=("这是视频号加密文件（前 128KiB 被 ISAAC64 加密），"
+                           "直接交付会花屏/打不开。需要该直链对应的 decode_key，"
+                           f"然后跑：run.py decrypt \"{result.file_path}\" "
+                           "--decode-key <decode_key>"),
+                )
+            if result.ok or cancelled():
+                return result
+            attempts.append(f"视频号 CDN：{result.error}")
 
         # 抖音/TikTok/快手：yt-dlp 已过时（a_bogus 签名），优先走 TikHub 第三方解析，
         # TikHub 失败/没配 key 时，抖音/TikTok 降级到「登录态 CDP」本地解析。
@@ -1110,6 +1230,29 @@ class Downloader:
                         return retry
                     attempts.append(f"读浏览器 cookie 重试：{retry.error}")
 
+        # X / Twitter：游客态经常拿不到 media（受限推文：需登录查看 / 带年龄门槛），
+        # yt-dlp 会报
+        # "No video could be found in this tweet" —— 但推文其实有视频。
+        # 镜像接口不需要登录就能给出 video.twimg.com 直链，这里兜底。
+        if twitter_mod.is_twitter(url):
+            items, caption, why = twitter_mod.fetch_media(
+                url,
+                timeout=float(self.config.get("net.timeout_sec", 20) or 20),
+                verify_tls=bool(self.config.get("net.verify_tls", True)))
+            videos = [item for item in items if item.get("kind") == "video"]
+            if videos:
+                best = videos[0]              # 已按分辨率从高到低排好
+                hint = title_hint or clean_media_title(caption, 60)
+                result = self.http.download(best["url"], job_dir, title_hint=hint,
+                                            progress=progress, cancel=cancel)
+                if result.ok or cancelled():
+                    return result
+                attempts.append(f"X/Twitter 直链：{result.error}")
+            elif items:
+                attempts.append("X/Twitter：这条推文只有图片，没有视频")
+            else:
+                attempts.append(f"X/Twitter：{why or '镜像接口没有返回媒体'}")
+
         # 快手：yt-dlp 已移除解析器，走自研 GraphQL 拿直链再下载
         if is_kuaishou(url):
             direct, caption = kuaishou_photo_url(url)
@@ -1135,6 +1278,123 @@ class Downloader:
             attempts.insert(0, "配置里关闭了 prefer_ytdlp")
 
         return DownloadResult(False, engine="", error="；".join(attempts))
+
+    # ── 微信视频号 ─────────────────────────────────────────────────
+    def download_channels_url(self, url: str, job_dir: Path, *,
+                              title_hint: str = "",
+                              progress: ProgressCallback = _noop,
+                              cancel: threading.Event | None = None,
+                              ) -> DownloadResult:
+        """解析视频号链接 → 直链下载 → 解密。"""
+        def log(message: str) -> None:
+            # 视频号解析链路的中间结论要留在日志里，否则失败了很难排查
+            progress(Progress(percent=0.0, stage=message))
+
+        media = wechat_channels.resolve_media(url, self.config, log=log)
+        if not media.ok:
+            return DownloadResult(False, engine="wechat_channels",
+                                  title=title_hint or media.title,
+                                  error=media.error)
+        return self.download_channels_media(
+            media, job_dir,
+            title_hint=title_hint or media.title,
+            progress=progress, cancel=cancel,
+        )
+
+    def download_channels_media(self, media: "wechat_channels.ChannelsMedia",
+                                job_dir: Path, *,
+                                title_hint: str = "",
+                                progress: ProgressCallback = _noop,
+                                cancel: threading.Event | None = None,
+                                ) -> DownloadResult:
+        """下载一条已解析出来的视频号媒体，并保证产物可播放。
+
+        两个坑都在这里兜住：
+
+        1. **403 往往是 Referer 引起的**。社区经验：视频号 CDN 有时会因为带了
+           Referer 而拒绝，去掉反而正常。所以带 header 失败后**去掉 header 再试一次**。
+        2. **前 128 KiB 是加密的**。下载完立刻验证 MP4 头，需要就解密；
+           解不开就明确失败，绝不把坏文件交付出去。
+        """
+        hint = title_hint or media.title or "视频号视频"
+        headers = dict(media.headers or {})
+        result = self.http.download(media.url, job_dir, title_hint=hint,
+                                    progress=progress, cancel=cancel,
+                                    headers=headers or None)
+        if not result.ok and headers and _is_forbidden(result.error):
+            # 社区经验：视频号 CDN 有时**因为带了 Referer**反而 403。
+            # 但只丢 Referer —— Cookie 是登录态，丢了这条内容多半就下不了了
+            # （登录态抓包拿到的 Cookie 正是为了这种情况留的）。
+            retry_headers = {k: v for k, v in headers.items()
+                             if k.lower() != "referer"} or None
+            result = self.http.download(media.url, job_dir, title_hint=hint,
+                                        progress=progress, cancel=cancel,
+                                        headers=retry_headers)
+        if not result.ok:
+            return result
+        if cancel is not None and cancel.is_set():
+            return result
+
+        settings = self.config.get("download.wechat_channels", {}) or {}
+        auto_decrypt = bool(settings.get("auto_decrypt", True)) if isinstance(
+            settings, dict) else True
+
+        meta = dict(result.meta or {})
+        meta.update({
+            "channels_via": media.via,
+            "channels_url": media.url,
+            "channels_decode_key": media.decode_key,
+        })
+        result.meta = meta
+        if media.file_size:
+            meta["channels_file_size"] = media.file_size
+
+        if wxdecrypt.needs_decrypt(result.file_path):
+            if not auto_decrypt:
+                return DownloadResult(
+                    False, engine="wechat_channels", title=result.title,
+                    error="视频号下发的是加密文件，但配置里关闭了 "
+                          "download.wechat_channels.auto_decrypt",
+                )
+            progress(Progress(percent=100.0, stage="解密视频号文件"))
+            ok, message = wxdecrypt.decrypt_file(result.file_path, media.decode_key)
+            if not ok:
+                return DownloadResult(
+                    False, engine="wechat_channels", title=result.title,
+                    error=f"视频号文件解密失败：{message}",
+                )
+            meta["decrypted"] = True
+            result.size_bytes = Path(result.file_path).stat().st_size
+            result.engine = "wechat_channels+http"
+            progress(Progress(percent=100.0, stage="解密完成"))
+        return result
+
+    def download_channels_episode(self, object_id: str, export_id: str,
+                                  job_dir: Path, *,
+                                  title_hint: str = "",
+                                  progress: ProgressCallback = _noop,
+                                  cancel: threading.Event | None = None,
+                                  ) -> DownloadResult:
+        """按 ``object_id`` / ``export_id`` 下一集视频号作品。
+
+        合集里的每一集在 TikHub 的列表接口里只有 id（直链会过期，不能提前取），
+        所以这里必须为每一集单独解析一次直链再下载。
+        """
+        ref = wechat_channels.ChannelsRef(object_id=object_id or "",
+                                          export_id=export_id or "")
+        if not ref.ok:
+            return DownloadResult(False, engine="wechat_channels",
+                                  title=title_hint,
+                                  error="这一集没有可用的 object_id / export_id")
+        media = wechat_channels.resolve_media("", self.config, ref=ref)
+        if not media.ok:
+            return DownloadResult(False, engine="wechat_channels",
+                                  title=title_hint or media.title,
+                                  error=media.error)
+        return self.download_channels_media(
+            media, job_dir, title_hint=title_hint or media.title,
+            progress=progress, cancel=cancel,
+        )
 
     def _retry_with_browser_cookies(self, url: str, job_dir: Path, title_hint: str,
                                     progress: ProgressCallback,

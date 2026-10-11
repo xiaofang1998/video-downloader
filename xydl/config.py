@@ -107,7 +107,62 @@ DEFAULTS: dict[str, Any] = {
             "weibo.com", "weibo.cn",
             "kuaishou.com", "gifshow.com",
             "bilibili.com", "b23.tv",
+            # 视频号网页版（channels.weixin.qq.com）登录态
+            "channels.weixin.qq.com",
         ],
+        # ── 多剧集 / 合集 ──────────────────────────────────────────
+        # B站的分P、合集、番剧、UP主投稿，以及视频号的短剧合集，
+        # 都会被展开成「N 集」按顺序下载。单集链接不受影响。
+        "series": {
+            # 关掉就退回「一次一条链接」的老行为
+            "enabled": True,
+            # 一次最多下多少集（防止误把 UP 主的 800 个投稿全下了）
+            "max_episodes": 50,
+            # 只下指定集：如 "1-10,15"；留空 = 全部
+            "episode_range": "",
+            # zip   = 打包成一个压缩包交付（默认，客户好接收）
+            # separate = 保留多个文件（控制台列表里仍然只显示第一个）
+            "mode": "zip",
+        },
+        # ── 微信视频号 ─────────────────────────────────────────────
+        # 视频号的分享短链（weixin.qq.com/sph/…）匿名只能拿到标题/封面。
+        # **mp4 目前只有一条真正可用的路：TikHub**（delivery.tikhub.api_key）。
+        #
+        # 为什么"扫码登录网页版然后用浏览器抓"这条路默认关掉了（2026-10 实测）：
+        #   · finder-preview 预览页在**登录状态下也只渲染封面图 + 二维码**，
+        #     页面上写着"可扫码前往微信观看此内容"，浏览器里没有任何视频请求；
+        #   · /web/pages/feed?eid=… 匿名请求返回 {"errCode":10012 非法请求}，
+        #     拿着有效的视频号助手登录态打开也拿不到 feed/媒体请求；
+        #   · 登录入口 /platform 是「视频号助手（创作者后台）」，和消费者侧的
+        #     网页播放不是同一套授权。
+        # 代码保留（换个账号/场景或腾讯改版后可能可用），但默认不启用 ——
+        # 否则每个视频号订单都会白等 25 秒、白弹一个浏览器窗口。
+        "wechat_channels": {
+            "enabled": True,
+            # 用登录态浏览器抓取：**实测对视频号无效**，默认关
+            "use_browser": False,
+            # 抓取时等待秒数
+            "browser_wait_sec": 25,
+            # 下载产物若是加密格式，自动解密（强烈建议保持 True）
+            "auto_decrypt": True,
+            # ── 本地抓包（`run.py channels-capture`）──────────────────
+            # 不依赖 TikHub 的唯一通道：本机架一个选择性 MITM 代理，把微信 PC
+            # 客户端播放视频时的媒体地址 + decode_key 截下来。
+            # 只有装了证书（当前用户根证书库，不需要管理员）才会真的解密。
+            "capture_store": "",          # 留空 = data/wx_capture.json
+            # decode_key 与直链必须来自同一次响应（key 每次都变），
+            # 所以只认这段时间内抓到的结果；过期就要求用户再播一次。
+            "capture_max_age_sec": 1800,
+            # ── 元宝入口（视频号短链 → 带 token 的直链）────────────────
+            # 产品流程是**引导客户自己走一次**：
+            #   识别出视频号短链 → 提示登录腾讯元宝 → 给按钮打开元宝 →
+            #   客户把链接粘进元宝，复制元宝解析出的直链 → 再粘回本工具下载。
+            # 所以默认**不**自动开浏览器、不自动调元宝接口（那会突然弹窗、还需要
+            # 一个常驻登录态）。想全自动的话把 yuanbao_enabled 打开，
+            # 并先用 `run.py channels-login --yuanbao` 登录一次。
+            "yuanbao_enabled": False,
+            "yuanbao_headless": False,
+        },
         # 传给 yt-dlp 的 --proxy；留空则跟随 net.proxy
         "proxy": "",
         # 优先画质：best / 1080 / 720 / 480
@@ -159,6 +214,23 @@ DEFAULTS: dict[str, Any] = {
         "received": "亲，链接收到啦～正在帮你下载，一般 1-3 分钟出文件，稍等我发你哈 😊",
         "downloading": "正在下载中，当前进度 {progress}%，稍等一下下～",
         "done": "下载好啦！\n文件：{filename}\n大小：{size}\n请查收，有任何问题随时找我～",
+        # 多剧集专用话术。占位符：{title} {count}（成功集数）{total}（总集数）
+        # {failed}（失败集数）{filename} {size}。
+        # {count} 与 {total} 必须分开用 —— 只写成功数会让"买 50 集只下到 5 集"
+        # 看起来像全部完成。
+        "series_done": (
+            "合集下载好啦！共 {total} 集，全部成功 ✅\n"
+            "打包文件：{filename}\n大小：{size}\n请查收，有任何问题随时找我～"
+        ),
+        # failed > 0 时**强制**用这条（清空它也只会在 series_done 后面追加一句
+        # 不可移除的提示，见 Replies.series_done）
+        "series_partial": (
+            "合集下载好了：共 {total} 集，成功 {count} 集，{failed} 集没下成功 📦\n"
+            "打包文件：{filename}\n大小：{size}\n"
+            "缺的那几集我可以重试，你说一声～"
+        ),
+        # 一次下不完（达到 download.series.max_episodes）时的补充说明；留空则不追加
+        "series_truncated_note": "（本次只下了前 {total} 集，是单次上限；要更多跟我说）",
         "need_manual": (
             "亲，这个链接我这边暂时没解析出来呢 🙏\n"
             "麻烦你换个方式发我：\n"
@@ -296,14 +368,29 @@ class Config:
         self.path = path
         self._data = _deep_merge(DEFAULTS, data or {})
 
+    def copy(self) -> "Config":
+        """复制一份**内存配置**（``path=None``，之后 save 也不会碰真实 config.json）。
+
+        用在"只对这一单生效"的覆盖上（例如界面上勾选的合集集号）：
+        直接改 ``self.config`` 会让并发的其它订单跟着变，那是很难查的串单 bug。
+        """
+        import copy as _copy
+
+        return Config(_copy.deepcopy(self._data), path=None)
+
     # ── 加载 / 保存 ────────────────────────────────────────────────
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
-        """从 config.json 读；文件不存在就写一份默认配置出去。"""
+        """从 config.json 读；文件不存在就写一份默认配置出去。
+
+        读取用 ``utf-8-sig``：Windows 记事本「UTF-8」默认**带 BOM**，而带 BOM 的
+        文件用普通 utf-8 解析会在第一个字节就 ``json.JSONDecodeError``，用户改一下
+        配置就起不来服务（真踩过）。``utf-8-sig`` 对无 BOM 文件的行为完全一致。
+        """
         cfg_path = Path(path) if path else app_dir() / "config.json"
         data: dict[str, Any] = {}
         if cfg_path.exists():
-            with open(cfg_path, "r", encoding="utf-8") as fh:
+            with open(cfg_path, "r", encoding="utf-8-sig") as fh:
                 data = json.load(fh)
         cfg = cls(data, path=cfg_path)
         if not cfg_path.exists():
