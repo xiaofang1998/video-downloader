@@ -9,26 +9,35 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = sorted((ROOT / "docs").glob("*.md")) + [ROOT / "README.md"]
 
-#: 文档里允许提到、但**故意不存在**的东西（已删除的东西 / 分支名等）
+#: 文档里允许提到、但**故意不存在**的东西（已删除的东西）
 ALLOW_MISSING = {
     "xydl/tikhub.py",          # 决策记录里写明"已删除"
-    "docs/requirements",       # 分支名，不是路径
-    "docs/architecture",
-    "docs/download-flows",
-    "docs/testing",
-    "docs/deployment",
-    "docs/collaboration",
-    "docs/readme-rewrite",
-    "docs/testing-accuracy",
-    "docs/verification",
     "tests/test_tikhub.py",    # 同上，已删除
 }
+
+
+def branch_names() -> set[str]:
+    """当前仓库里**真实存在**的分支名。
+
+    文档会引用分支（`docs/xxx`、`feature/xxx`），它们当然不是文件路径。
+    硬编码白名单会在"新开一个分支"的那一刻过期 —— 真踩到了：文档里加上
+    `docs/verification-fix` 之后自检立刻开始报错。所以直接问 git；
+    取不到（比如没装 git）就返回空集合，退化成按路径判定。
+    """
+    try:
+        out = subprocess.run(["git", "branch", "--format=%(refname:short)"],
+                             cwd=ROOT, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=10).stdout
+        return {line.strip() for line in out.splitlines() if line.strip()}
+    except (OSError, subprocess.SubprocessError):
+        return set()
 
 
 def _is_placeholder(text: str, *, bare_word_counts: bool = True) -> bool:
@@ -71,10 +80,12 @@ def check_links() -> list[str]:
 def check_code_refs() -> list[str]:
     """反引号里的源码路径必须存在（白名单除外）。"""
     problems: list[str] = []
+    branches = branch_names()          # 分支名不是文件路径，按实际分支放行
     for doc in DOCS:
         text = doc.read_text(encoding="utf-8")
         for ref in re.findall(r"`((?:xydl|tests|docs|webui|tools)/[\w/\-.]+)`", text):
-            if ref.endswith("/") or ref in ALLOW_MISSING or _is_placeholder(ref):
+            if (ref.endswith("/") or ref in ALLOW_MISSING or ref in branches
+                    or _is_placeholder(ref)):
                 continue
             if not (ROOT / ref).exists():
                 problems.append(f"{doc.name}: 引用了不存在的路径 `{ref}`")
