@@ -31,6 +31,27 @@ ALLOW_MISSING = {
 }
 
 
+def _is_placeholder(text: str, *, bare_word_counts: bool = True) -> bool:
+    """判断是不是文档里的**示例占位符**（如 ``[文字](路径)``、``test_xxx``）。
+
+    文档在讲"链接怎么写/测试怎么命名"时会用到占位符，它们本来就不该存在，
+    不能当成失效引用报出来 —— 否则这个脚本会把讲它自己的那篇文档判失败。
+
+    ``bare_word_counts``：只对**路径**生效 —— "既没有 / 也没有 ." 的字符串
+    不可能是文件路径（多半是中文占位词）。对**测试名**不能这么判，因为
+    ``test_this_case_does_not_exist`` 也是既没斜杠也没点，那样会被误当成占位符
+    （反向验证时真踩到了：注入的假测试名没被检出）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return True
+    if any(mark in text for mark in ("…", "...", "<", ">", "xxx", "文字", "路径", "某个")):
+        return True
+    if not bare_word_counts:
+        return False
+    return "/" not in text and "." not in text
+
+
 def check_links() -> list[str]:
     """markdown 链接指向的本地文件必须存在。"""
     problems: list[str] = []
@@ -38,6 +59,8 @@ def check_links() -> list[str]:
         for label, target in re.findall(r"\[([^\]]+)\]\(([^)]+)\)",
                                         doc.read_text(encoding="utf-8")):
             if target.startswith(("http://", "https://", "#")):
+                continue
+            if _is_placeholder(target):
                 continue
             path = (doc.parent / target.split("#")[0]).resolve()
             if not path.exists():
@@ -51,7 +74,7 @@ def check_code_refs() -> list[str]:
     for doc in DOCS:
         text = doc.read_text(encoding="utf-8")
         for ref in re.findall(r"`((?:xydl|tests|docs|webui|tools)/[\w/\-.]+)`", text):
-            if ref.endswith("/") or ref in ALLOW_MISSING:
+            if ref.endswith("/") or ref in ALLOW_MISSING or _is_placeholder(ref):
                 continue
             if not (ROOT / ref).exists():
                 problems.append(f"{doc.name}: 引用了不存在的路径 `{ref}`")
@@ -66,6 +89,8 @@ def check_test_names() -> list[str]:
     for doc in DOCS:
         text = doc.read_text(encoding="utf-8")
         for name in set(re.findall(r"`(test_\w+)`", text)):
+            if _is_placeholder(name, bare_word_counts=False):
+                continue
             if f"def {name}(" not in corpus:
                 problems.append(f"{doc.name}: 引用了不存在的测试 `{name}`")
     return problems
